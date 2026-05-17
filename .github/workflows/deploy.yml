@@ -44,7 +44,7 @@ jobs:
           REMOTE_PATH="${DEPLOY_PATH:-/www/wwwroot/blog}"
           export SSHPASS="$DEPLOY_PASSWORD"
 
-          SSH_CMD="sshpass -eSSHPASS ssh -o StrictHostKeyChecking=no"
+          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=no"
           REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
 
           $SSH_CMD "$REMOTE" "mkdir -p $(printf '%q' "$REMOTE_PATH")"
@@ -71,7 +71,7 @@ jobs:
           REMOTE_PATH="${DEPLOY_PATH:-/www/wwwroot/blog}"
           export SSHPASS="$DEPLOY_PASSWORD"
 
-          SSH_CMD="sshpass -eSSHPASS ssh -o StrictHostKeyChecking=no"
+          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=no"
           REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
           REMOTE_COMMAND="cd $(printf '%q' "$REMOTE_PATH") && hugo --gc --minify"
 
@@ -80,4 +80,3 @@ jobs:
       - name: Verify production site
         run: |
           curl --fail --head --max-time 20 https://shcxyz.site/
-
