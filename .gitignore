@@ -1,0 +1,14 @@
+.DS_Store
+.hugo_build.lock
+public/
+resources/_gen/
+
+# Local secrets and deployment-only files.
+.env
+*.key
+*.csr
+*.crt
+*.pem
+shcxyz.site_nginx/
+TencentCloud2026/
+

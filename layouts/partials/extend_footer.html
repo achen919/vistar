@@ -1,0 +1,21 @@
+{{- if .Site.Params.busuanzi -}}
+<!-- 不蒜子统计 -->
+<script async src="//busuanzi.ibruce.info/busuanzi/2.3/busuanzi.pure.mini.js"></script>
+<style>
+.busuanzi-footer {
+  text-align: center;
+  margin-top: 20px;
+  font-size: 0.9em;
+  color: var(--secondary);
+}
+</style>
+<div class="busuanzi-footer">
+  <span id="busuanzi_container_site_pv">
+    本站总访问量 <span id="busuanzi_value_site_pv"></span> 次
+  </span>
+  <span style="margin: 0 10px;">|</span>
+  <span id="busuanzi_container_site_uv">
+    访客数 <span id="busuanzi_value_site_uv"></span> 人次
+  </span>
+</div>
+{{- end -}}
