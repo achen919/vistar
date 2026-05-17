@@ -17,6 +17,21 @@ hugo --minify
 
 The generated `public/` directory is intentionally ignored. The server builds and serves `/www/wwwroot/blog/public`.
 
+## Automatic Deployment
+
+GitHub Actions deploys every push to `main`.
+
+The workflow checks out the repository with the PaperMod submodule, syncs the source to `/www/wwwroot/blog`, runs `hugo --gc --minify` on the server, and verifies `https://shcxyz.site/`.
+
+Required repository Secrets:
+
+| Secret | Value |
+| --- | --- |
+| `DEPLOY_HOST` | Server IP or hostname |
+| `DEPLOY_USER` | SSH user, for example `root` |
+| `DEPLOY_PASSWORD` | SSH password |
+| `DEPLOY_PATH` | Optional, defaults to `/www/wwwroot/blog` |
+
 ## Server Management
 
 Use the helper script without committing server credentials:
@@ -39,4 +54,3 @@ Nginx is configured to serve:
 The live certificate and private key are stored on the server at `/etc/nginx/ssl/shcxyz.site/`. Do not commit certificate private keys, panel credentials, or SSH passwords to this repository.
 
 The deployed nginx template is tracked at `deploy/nginx/shcxyz.site.conf`.
-
