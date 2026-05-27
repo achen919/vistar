@@ -1,0 +1,45 @@
+{{- define "main" }}
+
+{{- if .Title }}
+<header class="page-header">
+    <h1>{{ .Title }}</h1>
+    {{- if .Description }}
+    <div class="post-description">
+        {{ .Description | markdownify }}
+    </div>
+    {{- end }}
+</header>
+{{- end }}
+
+{{- $configuredCategories := site.Params.blogCategories }}
+{{- if $configuredCategories }}
+<ul class="terms-tags">
+    {{- range $configuredCategories }}
+    {{- $name := .name }}
+    {{- $termPage := site.GetPage (printf "/categories/%s" $name) }}
+    {{- $href := printf "/categories/%s/" ($name | urlize) | relLangURL }}
+    {{- with $termPage }}
+    {{- $href = .RelPermalink }}
+    {{- end }}
+    {{- $pages := where site.RegularPages "Params.categories" "intersect" (slice $name) }}
+    <li>
+        <a href="{{ $href }}">{{ $name }} <sup><strong><sup>{{ len $pages }}</sup></strong></sup></a>
+    </li>
+    {{- end }}
+</ul>
+{{- else }}
+<ul class="terms-tags">
+    {{- $type := .Type }}
+    {{- range $key, $value := .Data.Terms.Alphabetical }}
+    {{- $name := .Name }}
+    {{- $count := .Count }}
+    {{- with site.GetPage (printf "/%s/%s" $type $name) }}
+    <li>
+        <a href="{{ .Permalink }}">{{ .LinkTitle }} <sup><strong><sup>{{ $count }}</sup></strong></sup> </a>
+    </li>
+    {{- end }}
+    {{- end }}
+</ul>
+{{- end }}
+
+{{- end }}{{/* end main */ -}}
