@@ -1,6 +1,6 @@
 baseURL = 'https://shcxyz.site/'
 languageCode = 'zh-cn'
-title = '我的博客'
+title = '阿辰的博客'
 theme = 'PaperMod'
 
 [params]
@@ -31,8 +31,28 @@ theme = 'PaperMod'
   #   lang = 'zh-CN'
 
 [params.homeInfoParams]
-  Title = '你好，欢迎来到我的博客 👋'
-  Content = '这里记录我的学习和生活'
+  Title = '你好，欢迎来到阿辰的博客 👋'
+  Content = '这里记录后端开发、Agent、LLM，以及一些随笔。'
+
+[[params.blogCategories]]
+  name = '技术-后端开发'
+  description = '服务端开发、系统设计、数据库和工程实践。'
+
+[[params.blogCategories]]
+  name = '技术-agent'
+  description = 'AI Agent 的产品形态、工具调用、工作流和落地经验。'
+
+[[params.blogCategories]]
+  name = '技术-llm'
+  description = '大模型应用、提示词、评测、推理和模型生态。'
+
+[[params.blogCategories]]
+  name = '随笔-胡思乱想'
+  description = '不成体系的观察、想法和阶段性记录。'
+
+[[params.blogCategories]]
+  name = '随笔-如何搞钱'
+  description = '关于商业、收入、机会和实践路径的思考。'
 
 [[params.socialIcons]]
   name = 'github'
@@ -54,15 +74,20 @@ theme = 'PaperMod'
     url = '/archives/'
     weight = 20
   [[menu.main]]
+    identifier = 'categories'
+    name = '分类'
+    url = '/categories/'
+    weight = 30
+  [[menu.main]]
     identifier = 'search'
     name = '搜索'
     url = '/search/'
-    weight = 30
+    weight = 40
   [[menu.main]]
     identifier = 'tags'
     name = '标签'
     url = '/tags/'
-    weight = 40
+    weight = 50
 
 [outputs]
   home = ['HTML', 'RSS', 'JSON']

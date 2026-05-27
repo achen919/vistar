@@ -2,6 +2,14 @@
 
 Hugo blog deployed at <https://shcxyz.site/>.
 
+The site title is `阿辰的博客`. Articles are organized under five configured categories:
+
+- `技术-后端开发`
+- `技术-agent`
+- `技术-llm`
+- `随笔-胡思乱想`
+- `随笔-如何搞钱`
+
 ## Local Development
 
 ```bash
@@ -54,3 +62,4 @@ Nginx is configured to serve:
 The live certificate and private key are stored on the server at `/etc/nginx/ssl/shcxyz.site/`. Do not commit certificate private keys, panel credentials, or SSH passwords to this repository.
 
 The deployed nginx template is tracked at `deploy/nginx/shcxyz.site.conf`.
+The template also applies per-client Nginx request and connection limits.
