@@ -62,7 +62,7 @@ else
 fi
 install -d -m 755 "$(dirname "${HTPASSWD_FILE}")"
 printf '%s:%s\n' "${BLOG_ADMIN_USER}" "${HASH}" > "${HTPASSWD_FILE}"
-chmod 640 "${HTPASSWD_FILE}"
+chmod 644 "${HTPASSWD_FILE}"
 
 cat > /etc/blog-admin.env <<EOF
 BLOG_ADMIN_HOST=127.0.0.1
@@ -101,5 +101,14 @@ if nginx -t; then
   nginx -s reload
 fi
 
-curl --fail --silent --show-error http://127.0.0.1:18080/health >/dev/null
-echo "Blog admin is installed. Open https://shcxyz.site/admin/"
+for _ in $(seq 1 30); do
+  if curl --fail --silent --show-error http://127.0.0.1:18080/health >/dev/null; then
+    echo "Blog admin is installed. Open https://shcxyz.site/admin/"
+    exit 0
+  fi
+  sleep 1
+done
+
+systemctl status blog-admin.service --no-pager -l || true
+echo "blog-admin.service did not become healthy in time." >&2
+exit 1
