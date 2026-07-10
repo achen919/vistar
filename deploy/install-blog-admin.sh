@@ -13,6 +13,7 @@ BLOG_ADMIN_REPO_URL="${BLOG_ADMIN_REPO_URL:-git@github.com-vistar-blog-admin:ach
 BLOG_ADMIN_BRANCH="${BLOG_ADMIN_BRANCH:-main}"
 BLOG_ADMIN_PUBLIC_DIR="${BLOG_ADMIN_PUBLIC_DIR:-/www/wwwroot/blog/public}"
 BLOG_ADMIN_SSH_KEY="${BLOG_ADMIN_SSH_KEY:-/root/.ssh/vistar_blog_admin_ed25519}"
+BLOG_ADMIN_UPDATE_SUBMODULES="${BLOG_ADMIN_UPDATE_SUBMODULES:-0}"
 BLOG_DEPLOY_DIR="${BLOG_DEPLOY_DIR:-/www/wwwroot/blog}"
 HTPASSWD_FILE="${HTPASSWD_FILE:-/www/server/nginx/.htpasswd-blog-admin}"
 
@@ -71,17 +72,25 @@ BLOG_ADMIN_REPO_URL=${BLOG_ADMIN_REPO_URL}
 BLOG_ADMIN_BRANCH=${BLOG_ADMIN_BRANCH}
 BLOG_ADMIN_PUBLIC_DIR=${BLOG_ADMIN_PUBLIC_DIR}
 BLOG_ADMIN_SSH_KEY=${BLOG_ADMIN_SSH_KEY}
+BLOG_ADMIN_UPDATE_SUBMODULES=${BLOG_ADMIN_UPDATE_SUBMODULES}
 EOF
 chmod 600 /etc/blog-admin.env
 
 if [[ ! -d "${BLOG_ADMIN_SOURCE_DIR}/.git" ]]; then
   rm -rf "${BLOG_ADMIN_SOURCE_DIR}"
   GIT_SSH_COMMAND="ssh -i ${BLOG_ADMIN_SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
-    git clone --branch "${BLOG_ADMIN_BRANCH}" --recurse-submodules "${BLOG_ADMIN_REPO_URL}" "${BLOG_ADMIN_SOURCE_DIR}"
+    git clone --branch "${BLOG_ADMIN_BRANCH}" "${BLOG_ADMIN_REPO_URL}" "${BLOG_ADMIN_SOURCE_DIR}"
 else
   GIT_SSH_COMMAND="ssh -i ${BLOG_ADMIN_SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
     git -C "${BLOG_ADMIN_SOURCE_DIR}" pull --ff-only origin "${BLOG_ADMIN_BRANCH}"
+fi
+
+if [[ "${BLOG_ADMIN_UPDATE_SUBMODULES}" != "0" ]]; then
   git -C "${BLOG_ADMIN_SOURCE_DIR}" submodule update --init --recursive
+elif [[ -d "${BLOG_DEPLOY_DIR}/themes/PaperMod" && ! -f "${BLOG_ADMIN_SOURCE_DIR}/themes/PaperMod/theme.toml" ]]; then
+  mkdir -p "${BLOG_ADMIN_SOURCE_DIR}/themes"
+  rm -rf "${BLOG_ADMIN_SOURCE_DIR}/themes/PaperMod"
+  cp -a "${BLOG_DEPLOY_DIR}/themes/PaperMod" "${BLOG_ADMIN_SOURCE_DIR}/themes/PaperMod"
 fi
 
 cp "${BLOG_DEPLOY_DIR}/deploy/systemd/blog-admin.service" /etc/systemd/system/blog-admin.service

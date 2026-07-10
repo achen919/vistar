@@ -54,6 +54,10 @@ def branch_name() -> str:
     return env("BLOG_ADMIN_BRANCH", DEFAULT_BRANCH)
 
 
+def should_update_submodules() -> bool:
+    return env("BLOG_ADMIN_UPDATE_SUBMODULES", "1") != "0"
+
+
 def git_env() -> dict[str, str]:
     proc_env = os.environ.copy()
     ssh_key = os.environ.get("BLOG_ADMIN_SSH_KEY")
@@ -113,7 +117,8 @@ def ensure_source_repo() -> Path:
             HTTPStatus.INTERNAL_SERVER_ERROR,
         )
 
-    run(["git", "submodule", "update", "--init", "--recursive"], target, timeout=300, proc_env=proc_env)
+    if should_update_submodules():
+        run(["git", "submodule", "update", "--init", "--recursive"], target, timeout=300, proc_env=proc_env)
     return target
 
 
