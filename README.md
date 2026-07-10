@@ -80,6 +80,8 @@ cd /www/wwwroot/blog
 BLOG_ADMIN_USER='achen919' BLOG_ADMIN_PASSWORD='your-password' ./deploy/install-blog-admin.sh
 ```
 
+The installer defaults `BLOG_ADMIN_UPDATE_SUBMODULES=0` and copies the already-deployed PaperMod theme into the admin source clone. This avoids blocking publish operations on GitHub submodule network access from the server.
+
 ## SSL
 
 Nginx is configured to serve:
