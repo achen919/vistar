@@ -77,6 +77,19 @@ jobs:
 
           $SSH_CMD "$REMOTE" "$REMOTE_COMMAND"
 
+      - name: Restart blog admin service when installed
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          export SSHPASS="$DEPLOY_PASSWORD"
+          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=no"
+          REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
+          $SSH_CMD "$REMOTE" "if systemctl list-unit-files blog-admin.service >/dev/null 2>&1; then systemctl restart blog-admin.service; fi"
+
       - name: Verify production site
         run: |
           curl --fail --head --max-time 20 https://shcxyz.site/
