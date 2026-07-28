@@ -1,22 +1,59 @@
-import { api, ApiError, clearCsrfToken, setUnauthorizedHandler } from "./api.js";
-import { escapeHtml, icon } from "./ui.js";
-import { renderDashboard } from "./pages/dashboard.js";
-import { renderArticles } from "./pages/articles.js";
-import { renderEditor } from "./pages/editor.js";
-import { renderCategories } from "./pages/categories.js";
-import { renderAnalytics } from "./pages/analytics.js";
+import {
+  api,
+  ApiError,
+  clearCsrfToken,
+  setUnauthorizedHandler,
+} from "./api.js?v=20260728-console-2";
+import { escapeHtml, icon } from "./ui.js?v=20260728-console-2";
 
+const ASSET_VERSION = "20260728-console-2";
 const app = document.querySelector("#app");
 const confirmDialog = document.querySelector("#globalConfirmDialog");
 const toastRegion = document.querySelector("#toastRegion");
 
 const routes = [
-  { match: /^\/admin\/?$/, title: "仪表盘", description: "博客运营概览", render: renderDashboard },
-  { match: /^\/admin\/articles\/?$/, title: "文章管理", description: "管理全部内容与发布状态", render: renderArticles },
-  { match: /^\/admin\/articles\/new\/?$/, title: "新建文章", description: "撰写并发布新的博客内容", render: renderEditor },
-  { match: /^\/admin\/articles\/edit\/?$/, title: "编辑文章", description: "修改文章内容与发布状态", render: renderEditor },
-  { match: /^\/admin\/categories\/?$/, title: "分类管理", description: "维护分类并调整前台展示顺序", render: renderCategories },
-  { match: /^\/admin\/analytics\/?$/, title: "数据统计", description: "查看网站访问与内容表现", render: renderAnalytics },
+  {
+    match: /^\/admin\/?$/,
+    title: "仪表盘",
+    description: "博客运营概览",
+    load: () => import("./pages/dashboard.js?v=20260728-console-2")
+      .then((module) => module.renderDashboard),
+  },
+  {
+    match: /^\/admin\/articles\/?$/,
+    title: "文章管理",
+    description: "管理全部内容与发布状态",
+    load: () => import("./pages/articles.js?v=20260728-console-2")
+      .then((module) => module.renderArticles),
+  },
+  {
+    match: /^\/admin\/articles\/new\/?$/,
+    title: "新建文章",
+    description: "撰写并发布新的博客内容",
+    load: () => import("./pages/editor.js?v=20260728-console-2")
+      .then((module) => module.renderEditor),
+  },
+  {
+    match: /^\/admin\/articles\/edit\/?$/,
+    title: "编辑文章",
+    description: "修改文章内容与发布状态",
+    load: () => import("./pages/editor.js?v=20260728-console-2")
+      .then((module) => module.renderEditor),
+  },
+  {
+    match: /^\/admin\/categories\/?$/,
+    title: "分类管理",
+    description: "维护分类并调整前台展示顺序",
+    load: () => import("./pages/categories.js?v=20260728-console-2")
+      .then((module) => module.renderCategories),
+  },
+  {
+    match: /^\/admin\/analytics\/?$/,
+    title: "数据统计",
+    description: "查看网站访问与内容表现",
+    load: () => import("./pages/analytics.js?v=20260728-console-2")
+      .then((module) => module.renderAnalytics),
+  },
 ];
 
 let sessionInfo = null;
@@ -24,6 +61,10 @@ let pageController = null;
 let pageCleanup = null;
 let leaveGuard = null;
 let currentLocation = `${window.location.pathname}${window.location.search}`;
+
+function markBootComplete() {
+  if (window.__blogAdminBoot) window.__blogAdminBoot.complete();
+}
 
 function authenticated(payload) {
   if (!payload || payload.authenticated === false) return false;
@@ -121,6 +162,7 @@ function renderLogin(message = "") {
       button.innerHTML = "<span>登录</span>";
     }
   });
+  markBootComplete();
 }
 
 function renderShell() {
@@ -177,6 +219,7 @@ function renderShell() {
 
   app.removeEventListener("click", handleShellClick);
   app.addEventListener("click", handleShellClick);
+  markBootComplete();
 }
 
 async function handleShellClick(event) {
@@ -216,6 +259,28 @@ function routeFor(pathname) {
   return routes.find((route) => route.match.test(pathname));
 }
 
+async function ensureCurrentAssetVersion(signal) {
+  const response = await fetch(
+    `/admin/version.json?expected=${encodeURIComponent(ASSET_VERSION)}`,
+    {
+      cache: "no-store",
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+      signal,
+    },
+  );
+  const contentType = response.headers.get("Content-Type") || "";
+  if (!response.ok || !contentType.includes("application/json")) {
+    throw new ApiError("无法确认管理后台版本，请重新加载页面。", response.status);
+  }
+  const payload = await response.json();
+  if (payload.version !== ASSET_VERSION) {
+    window.location.reload();
+    return false;
+  }
+  return true;
+}
+
 function updateNavigation(route) {
   const section = route?.match === routes[0].match
     ? "dashboard"
@@ -241,7 +306,8 @@ async function renderRoute() {
   pageCleanup?.();
   pageCleanup = null;
   leaveGuard = null;
-  pageController = new AbortController();
+  const controller = new AbortController();
+  pageController = controller;
   document.body.classList.remove("nav-open");
   currentLocation = `${window.location.pathname}${window.location.search}`;
 
@@ -269,7 +335,7 @@ async function renderRoute() {
   const context = {
     api,
     container: content,
-    signal: pageController.signal,
+    signal: controller.signal,
     navigate,
     toast,
     confirm: confirmAction,
@@ -286,11 +352,24 @@ async function renderRoute() {
   };
 
   try {
-    const cleanup = await route.render(context);
-    if (!pageController.signal.aborted && typeof cleanup === "function") pageCleanup = cleanup;
+    if (!(await ensureCurrentAssetVersion(controller.signal))) return;
+    if (controller.signal.aborted || pageController !== controller) return;
+    const render = await route.load();
+    if (controller.signal.aborted || pageController !== controller) return;
+    const cleanup = await render(context);
+    if (controller.signal.aborted || pageController !== controller) {
+      if (typeof cleanup === "function") cleanup();
+      return;
+    }
+    if (typeof cleanup === "function") pageCleanup = cleanup;
     content.focus({ preventScroll: true });
   } catch (error) {
-    if (error.name === "AbortError" || error.status === 401) return;
+    if (
+      controller.signal.aborted
+      || pageController !== controller
+      || error.name === "AbortError"
+      || error.status === 401
+    ) return;
     content.innerHTML = `
       <section class="fatal-page-error">
         ${icon("warning", 30)}
@@ -378,8 +457,10 @@ window.addEventListener("beforeunload", (event) => {
 });
 
 async function bootstrap() {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), 8000);
   try {
-    const payload = await api.session();
+    const payload = await api.session(controller.signal);
     if (!authenticated(payload)) {
       renderLogin();
       return;
@@ -388,8 +469,12 @@ async function bootstrap() {
     renderShell();
     await renderRoute();
   } catch (error) {
-    if (error.status === 401) renderLogin();
+    if (error.name === "AbortError") {
+      renderLogin("会话验证超时，请检查网络后重试。");
+    } else if (error.status === 401) renderLogin();
     else renderLogin(`暂时无法验证登录状态：${error.message}`);
+  } finally {
+    window.clearTimeout(timeoutId);
   }
 }
 

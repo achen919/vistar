@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" class="no-js">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -7,11 +7,19 @@
     <meta name="color-scheme" content="light" />
     <title>博客管理后台 | 阿辰的博客</title>
     <link rel="icon" href="data:," />
-    <link rel="stylesheet" href="/admin/styles.css" />
+    <link rel="stylesheet" href="/admin/styles.css?v=20260728-console-2" />
+    <script src="/admin/boot.js?v=20260728-console-2"></script>
   </head>
   <body>
     <div id="app" class="app-root" aria-live="polite">
-      <div class="boot-screen">
+      <noscript>
+        <main class="boot-screen">
+          <div class="brand-mark" aria-hidden="true">辰</div>
+          <h1>需要启用 JavaScript</h1>
+          <p>管理后台依赖 JavaScript，请启用后重新加载页面。</p>
+        </main>
+      </noscript>
+      <div class="boot-screen js-boot-screen">
         <div class="brand-mark" aria-hidden="true">辰</div>
         <p>正在验证管理会话…</p>
       </div>
@@ -32,6 +40,6 @@
     </dialog>
 
     <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
-    <script type="module" src="/admin/admin.js"></script>
+    <script type="module" src="/admin/admin.js?v=20260728-console-2"></script>
   </body>
 </html>

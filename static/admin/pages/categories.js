@@ -5,7 +5,7 @@ import {
   formatNumber,
   icon,
   loadingState,
-} from "../ui.js";
+} from "../ui.js?v=20260728-console-2";
 
 export async function renderCategories(context) {
   const { api, container, signal, confirm, toast, setLeaveGuard } = context;

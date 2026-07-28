@@ -58,9 +58,11 @@ async function request(path, options = {}) {
   let payload = null;
   if (response.status !== 204) {
     try {
-      payload = contentType.includes("application/json")
-        ? await response.json()
-        : { error: await response.text() };
+      if (contentType.includes("application/json")) {
+        payload = await response.json();
+      } else {
+        await response.text();
+      }
     } catch {
       payload = null;
     }
