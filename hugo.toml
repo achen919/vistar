@@ -33,31 +33,50 @@ theme = 'PaperMod'
 [params.homeInfoParams]
   Title = '你好，欢迎来到阿辰的博客 👋'
   Content = '这里记录后端开发、Agent、LLM，以及一些随笔。'
+[[params.blogCategories]]
+  id = "cat-8774770dd8047c5c"
+  name = "技术-后端开发"
+  description = "服务端开发、系统设计、数据库和工程实践。"
 
 [[params.blogCategories]]
-  id = 'cat-8774770dd8047c5c'
-  name = '技术-后端开发'
-  description = '服务端开发、系统设计、数据库和工程实践。'
+  id = "cat-289c83766012ff84"
+  name = "技术-agent"
+  description = "AI Agent 的产品形态、工具调用、工作流和落地经验。"
 
 [[params.blogCategories]]
-  id = 'cat-289c83766012ff84'
-  name = '技术-agent'
-  description = 'AI Agent 的产品形态、工具调用、工作流和落地经验。'
+  id = "cat-d0c02acbca74b62c"
+  name = "技术-llm"
+  description = "大模型应用、提示词、评测、推理和模型生态。"
 
 [[params.blogCategories]]
-  id = 'cat-d0c02acbca74b62c'
-  name = '技术-llm'
-  description = '大模型应用、提示词、评测、推理和模型生态。'
+  id = "cat-1ddb1910ada98d14"
+  name = "技术-infra"
+  description = ""
 
 [[params.blogCategories]]
-  id = 'cat-07940c4850de305c'
-  name = '随笔-胡思乱想'
-  description = '不成体系的观察、想法和阶段性记录。'
+  id = "cat-2c4c11ac22d14e03"
+  name = "技术-模型部署"
+  description = ""
 
 [[params.blogCategories]]
-  id = 'cat-8ce606917c621a67'
-  name = '随笔-如何搞钱'
-  description = '关于商业、收入、机会和实践路径的思考。'
+  id = "cat-8ce606917c621a67"
+  name = "随笔-如何搞钱"
+  description = "关于商业、收入、机会和实践路径的思考。"
+
+[[params.blogCategories]]
+  id = "cat-07940c4850de305c"
+  name = "随笔-胡思乱想"
+  description = "不成体系的观察、想法和阶段性记录。"
+
+[[params.blogCategories]]
+  id = "cat-11c5161dcb0cfd55"
+  name = "随笔-情感"
+  description = ""
+
+[[params.blogCategories]]
+  id = "cat-2e4e786f5b00f732"
+  name = "随笔-自我反思"
+  description = ""
 
 [[params.socialIcons]]
   name = 'github'
