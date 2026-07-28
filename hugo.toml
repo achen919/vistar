@@ -78,6 +78,11 @@ theme = 'PaperMod'
   name = "随笔-自我反思"
   description = ""
 
+[[params.blogCategories]]
+  id = "cat-e36dd32e311aa56d"
+  name = "阅读-经营未来"
+  description = "李明博自传"
+
 [[params.socialIcons]]
   name = 'github'
   url = 'https://github.com/'
