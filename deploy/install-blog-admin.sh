@@ -29,7 +29,7 @@ if [[ ! "${BLOG_ADMIN_USER}" =~ ^[A-Za-z0-9_.@-]{1,64}$ ]]; then
   exit 1
 fi
 for required_command in \
-  awk chgrp chmod chown cp curl date find getent git hugo id install mv \
+  awk chgrp chmod chown cp curl date dirname find getent git hugo id install mv \
   nginx openssl python3 runuser sed seq sleep ssh ssh-keygen stat systemctl \
   tr useradd usermod; do
   if ! command -v "${required_command}" >/dev/null 2>&1; then
@@ -373,6 +373,29 @@ elif [[ -f "${BLOG_ADMIN_ACCESS_LOG}" ]] && command -v setfacl >/dev/null 2>&1; 
   setfacl -m "u:${BLOG_ADMIN_SERVICE_USER}:r" "${BLOG_ADMIN_ACCESS_LOG}"
 fi
 if [[ -f "${BLOG_ADMIN_ACCESS_LOG}" ]] && \
+  ! runuser -u "${BLOG_ADMIN_SERVICE_USER}" -- test -r "${BLOG_ADMIN_ACCESS_LOG}" && \
+  command -v setfacl >/dev/null 2>&1; then
+  case "${BLOG_ADMIN_ACCESS_LOG}" in
+    /www/wwwlogs/*)
+      LOG_ACL_STOP="/www"
+      ;;
+    /var/log/nginx/*)
+      LOG_ACL_STOP="/var/log"
+      ;;
+    *)
+      echo "Refusing ACL changes outside the validated log roots." >&2
+      exit 1
+      ;;
+  esac
+  LOG_ACL_DIR="$(dirname "${BLOG_ADMIN_ACCESS_LOG}")"
+  while [[ "${LOG_ACL_DIR}" != "${LOG_ACL_STOP}" ]]; do
+    if ! runuser -u "${BLOG_ADMIN_SERVICE_USER}" -- test -x "${LOG_ACL_DIR}"; then
+      setfacl -m "u:${BLOG_ADMIN_SERVICE_USER}:--x" "${LOG_ACL_DIR}"
+    fi
+    LOG_ACL_DIR="$(dirname "${LOG_ACL_DIR}")"
+  done
+fi
+if [[ -f "${BLOG_ADMIN_ACCESS_LOG}" ]] && \
   ! runuser -u "${BLOG_ADMIN_SERVICE_USER}" -- test -r "${BLOG_ADMIN_ACCESS_LOG}"; then
   echo "${BLOG_ADMIN_SERVICE_USER} cannot read ${BLOG_ADMIN_ACCESS_LOG}." >&2
   echo "Set BLOG_ADMIN_LOG_GROUP and configure log rotation to preserve that group." >&2
@@ -401,6 +424,8 @@ if [[ ! -d "${BLOG_ADMIN_SOURCE_DIR}/.git" ]]; then
     git clone --branch "${BLOG_ADMIN_BRANCH}" "${BLOG_ADMIN_REPO_URL}" "${BLOG_ADMIN_SOURCE_DIR}"
 else
   chown -R "${BLOG_ADMIN_SERVICE_USER}:${BLOG_ADMIN_SERVICE_USER}" "${BLOG_ADMIN_SOURCE_DIR}"
+  runuser -u "${BLOG_ADMIN_SERVICE_USER}" -- \
+    git -C "${BLOG_ADMIN_SOURCE_DIR}" remote set-url origin "${BLOG_ADMIN_REPO_URL}"
   runuser -u "${BLOG_ADMIN_SERVICE_USER}" -- env \
     HOME="${BLOG_ADMIN_STATE_DIR}" \
     GIT_SSH_COMMAND="${GIT_SSH_COMMAND}" \

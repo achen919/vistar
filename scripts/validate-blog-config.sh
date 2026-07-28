@@ -62,6 +62,17 @@ grep -Fq "Content-Security-Policy" deploy/nginx/shcxyz.site.conf
 grep -Fq "frame-ancestors 'none'" deploy/nginx/shcxyz.site.conf
 grep -Fq "location = /analytics/summary" deploy/nginx/shcxyz.site.conf
 grep -Fq "proxy_pass http://127.0.0.1:18080/analytics/summary;" deploy/nginx/shcxyz.site.conf
+if grep -Eq 'listen .*default_server|server_name .*_;' deploy/nginx/shcxyz.site.conf; then
+  echo "The site template must not claim the shared Nginx default server." >&2
+  exit 1
+fi
+
+grep -Fq 'cancel-in-progress: false' .github/workflows/deploy.yml
+grep -Fq 'EXPECTED_REMOTE_PATH="/www/wwwroot/blog"' .github/workflows/deploy.yml
+grep -Fq 'Refusing symbolic-link deployment path' .github/workflows/deploy.yml
+grep -Fq 'Legacy HTTP Basic Auth is still active' .github/workflows/deploy.yml
+grep -Fq 'setfacl -m "u:${BLOG_ADMIN_SERVICE_USER}:--x"' deploy/install-blog-admin.sh
+grep -Fq 'remote set-url origin "${BLOG_ADMIN_REPO_URL}"' deploy/install-blog-admin.sh
 
 if grep -REiq 'busuanzi\.ibruce\.info|busuanzi\.pure' layouts static; then
   echo "The third-party Busuanzi script must not be present." >&2
