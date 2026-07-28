@@ -7,7 +7,7 @@ import {
   slugify,
   today,
   unwrap,
-} from "../ui.js?v=20260728-console-2";
+} from "../ui.js?v=20260728-console-3";
 
 export async function renderEditor(context) {
   const { api, container, signal, navigate, toast, confirm, setLeaveGuard, setTitle } = context;
@@ -113,8 +113,13 @@ export async function renderEditor(context) {
       <section class="editor-workspace">
         <div class="panel editor-area">
           <div class="panel-header">
-            <div><h2>Markdown 正文</h2><p>支持标题、列表、引用、链接与代码块</p></div>
-            <span id="wordCount" class="editor-counter">0 字</span>
+            <div><h2>Markdown 正文</h2><p>支持标题、列表、引用、链接、图片与代码块</p></div>
+            <div class="editor-header-actions">
+              <span id="wordCount" class="editor-counter">0 字</span>
+              <button type="button" class="button button-secondary button-sm" data-insert-image>
+                ${icon("image", 16)}插入图片
+              </button>
+            </div>
           </div>
           <label>
             <span class="is-hidden">Markdown 正文</span>
@@ -137,6 +142,62 @@ export async function renderEditor(context) {
         <button type="submit" class="button button-primary" data-save="publish">${editing && !post.draft ? "保存并发布" : "发布文章"}</button>
       </div>
     </form>
+
+    <dialog id="imageUploadDialog" class="dialog" aria-labelledby="imageUploadDialogTitle">
+      <form id="imageUploadForm" class="dialog-card" novalidate>
+        <div class="dialog-header">
+          <div>
+            <h2 id="imageUploadDialogTitle">插入图片</h2>
+            <p>上传完成后，图片 Markdown 会插入到正文当前光标位置。</p>
+          </div>
+          <button type="button" class="icon-button" data-close-image-dialog aria-label="关闭">${icon("close", 18)}</button>
+        </div>
+        <div class="dialog-body">
+          <input
+            class="is-hidden"
+            name="imageFile"
+            type="file"
+            accept="image/jpeg,image/png,image/gif,image/webp"
+            data-image-file
+          />
+          <button type="button" class="image-file-picker" data-choose-image>
+            <span class="image-file-picker-icon" aria-hidden="true">${icon("image", 22)}</span>
+            <span>
+              <strong>选择本地图片</strong>
+              <small>支持 PNG、JPEG、GIF、WebP；上传后会安全重编码，不接受 SVG</small>
+            </span>
+          </button>
+
+          <div class="image-upload-preview is-hidden" data-image-preview>
+            <img data-image-preview-img alt="待上传图片预览" />
+            <div class="image-upload-file-copy">
+              <strong data-image-file-name></strong>
+              <small data-image-file-meta></small>
+            </div>
+            <button type="button" class="button button-secondary button-sm" data-replace-image>更换图片</button>
+          </div>
+
+          <label class="field">
+            <span class="field-label">图片说明 <small>用于无障碍访问和图片加载失败时展示</small></span>
+            <input name="imageAlt" type="text" maxlength="160" autocomplete="off" placeholder="例如：后台访问量趋势图" required />
+            <span class="field-error is-hidden" data-image-alt-error></span>
+          </label>
+
+          <div class="image-upload-progress is-hidden" data-image-progress role="status" aria-live="polite">
+            <div>
+              <span data-image-progress-label>准备上传…</span>
+              <span data-image-progress-value></span>
+            </div>
+            <progress max="100" value="0" data-image-progress-bar>0%</progress>
+          </div>
+          <p class="form-alert is-hidden" data-image-error role="alert"></p>
+        </div>
+        <div class="dialog-actions">
+          <button type="button" class="button button-secondary" data-close-image-dialog>取消</button>
+          <button type="submit" class="button button-primary" data-upload-image disabled>上传并插入</button>
+        </div>
+      </form>
+    </dialog>
   `;
 
   const form = container.querySelector("#articleForm");
@@ -147,9 +208,36 @@ export async function renderEditor(context) {
   const preview = container.querySelector("#markdownPreview");
   const wordCount = container.querySelector("#wordCount");
   const alertBox = container.querySelector("#editorAlert");
+  const imageDialog = container.querySelector("#imageUploadDialog");
+  const imageForm = container.querySelector("#imageUploadForm");
+  const imageFileInput = imageForm.elements.imageFile;
+  const imageAltInput = imageForm.elements.imageAlt;
+  const imagePreview = imageForm.querySelector("[data-image-preview]");
+  const imagePreviewImg = imageForm.querySelector("[data-image-preview-img]");
+  const imageError = imageForm.querySelector("[data-image-error]");
+  const imageAltError = imageForm.querySelector("[data-image-alt-error]");
+  const imageProgress = imageForm.querySelector("[data-image-progress]");
+  const imageProgressBar = imageForm.querySelector("[data-image-progress-bar]");
+  const imageProgressLabel = imageForm.querySelector("[data-image-progress-label]");
+  const imageProgressValue = imageForm.querySelector("[data-image-progress-value]");
+  const uploadImageButton = imageForm.querySelector("[data-upload-image]");
+  const allowedImageTypes = new Set([
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+  ]);
   let slugTouched = editing || Boolean(post.slug);
   let baseline = snapshot();
   let saving = false;
+  let uploadingImage = false;
+  let selectedImage = null;
+  let imagePreviewUrl = "";
+  let uploadController = null;
+  let insertionRange = {
+    start: contentInput.value.length,
+    end: contentInput.value.length,
+  };
 
   function snapshot() {
     return JSON.stringify(collectPost());
@@ -189,6 +277,182 @@ export async function renderEditor(context) {
     const text = contentInput.value;
     preview.innerHTML = renderMarkdown(text);
     wordCount.textContent = `${text.replace(/\s/g, "").length} 字`;
+  }
+
+  function rememberInsertionRange() {
+    if (!Number.isInteger(contentInput.selectionStart) || !Number.isInteger(contentInput.selectionEnd)) return;
+    insertionRange = {
+      start: contentInput.selectionStart,
+      end: contentInput.selectionEnd,
+    };
+  }
+
+  function revokeImagePreview() {
+    if (!imagePreviewUrl) return;
+    URL.revokeObjectURL(imagePreviewUrl);
+    imagePreviewUrl = "";
+  }
+
+  function setImageError(message = "") {
+    imageError.textContent = message;
+    imageError.classList.toggle("is-hidden", !message);
+  }
+
+  function resetImageDialog() {
+    uploadController?.abort();
+    uploadController = null;
+    uploadingImage = false;
+    selectedImage = null;
+    revokeImagePreview();
+    imageForm.reset();
+    imagePreview.classList.add("is-hidden");
+    imageProgress.classList.add("is-hidden");
+    imageProgressBar.value = 0;
+    imageProgressLabel.textContent = "准备上传…";
+    imageProgressValue.textContent = "";
+    imageAltError.textContent = "";
+    imageAltError.classList.add("is-hidden");
+    setImageError();
+    imageForm.querySelectorAll("button, input").forEach((element) => {
+      element.disabled = false;
+    });
+    uploadImageButton.disabled = true;
+  }
+
+  function setImageUploadControls(disabled) {
+    imageFileInput.disabled = disabled;
+    imageAltInput.disabled = disabled;
+    imageForm.querySelector("[data-choose-image]").disabled = disabled;
+    imageForm.querySelector("[data-replace-image]").disabled = disabled;
+    uploadImageButton.disabled = disabled || !selectedImage;
+  }
+
+  function closeImageDialog() {
+    uploadController?.abort();
+    if (imageDialog.open) imageDialog.close();
+    resetImageDialog();
+    contentInput.focus({ preventScroll: true });
+    contentInput.setSelectionRange(insertionRange.start, insertionRange.end);
+  }
+
+  function openImageDialog() {
+    if (saving || uploadingImage) return;
+    rememberInsertionRange();
+    resetImageDialog();
+    imageDialog.showModal();
+    window.setTimeout(() => imageForm.querySelector("[data-choose-image]")?.focus(), 0);
+  }
+
+  function selectImage(file) {
+    setImageError();
+    imageAltError.textContent = "";
+    imageAltError.classList.add("is-hidden");
+    if (!file) return;
+    const looksLikeSvg = file.type === "image/svg+xml" || /\.svgz?$/i.test(file.name);
+    if (looksLikeSvg || !allowedImageTypes.has(file.type)) {
+      selectedImage = null;
+      imageFileInput.value = "";
+      uploadImageButton.disabled = true;
+      setImageError("仅支持 PNG、JPEG、GIF 或 WebP 图片，不能上传 SVG。");
+      return;
+    }
+
+    selectedImage = file;
+    revokeImagePreview();
+    imagePreviewUrl = URL.createObjectURL(file);
+    imagePreviewImg.src = imagePreviewUrl;
+    imagePreviewImg.alt = imageAltInput.value.trim() || "待上传图片预览";
+    imageForm.querySelector("[data-image-file-name]").textContent = file.name;
+    imageForm.querySelector("[data-image-file-meta]").textContent = `${formatFileSize(file.size)} · ${file.type}`;
+    if (!imageAltInput.value.trim()) {
+      imageAltInput.value = file.name.replace(/\.[^.]+$/, "").replaceAll(/[-_]+/g, " ").trim();
+    }
+    imagePreviewImg.alt = imageAltInput.value.trim() || "待上传图片预览";
+    imagePreview.classList.remove("is-hidden");
+    uploadImageButton.disabled = false;
+    imageAltInput.focus();
+    imageAltInput.select();
+  }
+
+  function setUploadProgress(value) {
+    const progress = Number(value);
+    imageProgress.classList.remove("is-hidden");
+    if (!Number.isFinite(progress) || progress <= 0) {
+      imageProgressBar.removeAttribute("value");
+      imageProgressLabel.textContent = "正在上传图片…";
+      imageProgressValue.textContent = "";
+      return;
+    }
+    const normalized = Math.min(100, Math.max(0, Math.round(progress)));
+    imageProgressBar.value = normalized;
+    imageProgressLabel.textContent = normalized >= 100 ? "正在处理图片…" : "正在上传图片…";
+    imageProgressValue.textContent = `${normalized}%`;
+  }
+
+  function insertImageMarkdown(url, alt) {
+    const safeUrl = validateUploadedImageUrl(url);
+    const safeAlt = String(alt || "")
+      .replaceAll("\\", "\\\\")
+      .replaceAll("]", "\\]")
+      .replaceAll(/\s+/g, " ")
+      .trim();
+    const markdown = `![${safeAlt}](${safeUrl})`;
+    const start = Math.min(insertionRange.start, contentInput.value.length);
+    const end = Math.min(Math.max(insertionRange.end, start), contentInput.value.length);
+    const before = contentInput.value.slice(0, start);
+    const after = contentInput.value.slice(end);
+    const leading = before && !before.endsWith("\n") ? "\n\n" : "";
+    const trailing = after && !after.startsWith("\n") ? "\n\n" : "";
+    const insertion = `${leading}${markdown}${trailing}`;
+    contentInput.setRangeText(insertion, start, end, "end");
+    rememberInsertionRange();
+    contentInput.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  async function uploadImage(event) {
+    event.preventDefault();
+    if (uploadingImage || !selectedImage) return;
+    const alt = imageAltInput.value.trim();
+    if (!alt) {
+      imageAltError.textContent = "请填写能说明图片内容的文字。";
+      imageAltError.classList.remove("is-hidden");
+      imageAltInput.focus();
+      return;
+    }
+
+    uploadingImage = true;
+    setImageError();
+    imageAltError.textContent = "";
+    imageAltError.classList.add("is-hidden");
+    setImageUploadControls(true);
+    uploadImageButton.innerHTML = '<span class="spinner spinner-light" aria-hidden="true"></span>正在上传';
+    setUploadProgress(0);
+
+    const controller = new AbortController();
+    uploadController = controller;
+    const abortUpload = () => controller.abort();
+    signal.addEventListener("abort", abortUpload, { once: true });
+    try {
+      const result = await api.uploadImage(selectedImage, controller.signal, setUploadProgress);
+      if (signal.aborted || controller.signal.aborted) return;
+      const uploadedUrl = result?.url || extractImageUrl(result?.markdown);
+      insertImageMarkdown(uploadedUrl, alt);
+      toast("图片已上传并插入正文。");
+      closeImageDialog();
+    } catch (error) {
+      if (error.name === "AbortError") return;
+      setImageError(error.message || "图片上传失败，请稍后重试。");
+      toast(error.message || "图片上传失败，请稍后重试。", "error");
+    } finally {
+      signal.removeEventListener("abort", abortUpload);
+      uploadingImage = false;
+      if (uploadController === controller) uploadController = null;
+      if (imageDialog.open) {
+        setImageUploadControls(false);
+        uploadImageButton.textContent = "上传并插入";
+        if (imageProgressBar.value < 100) imageProgress.classList.add("is-hidden");
+      }
+    }
   }
 
   function clearErrors() {
@@ -251,6 +515,7 @@ export async function renderEditor(context) {
     form.querySelectorAll("[data-save]").forEach((button) => {
       button.disabled = active;
     });
+    form.querySelector("[data-insert-image]").disabled = active;
     if (active) saveState.textContent = "正在保存并发布…";
   }
 
@@ -315,6 +580,9 @@ export async function renderEditor(context) {
   slugInput.addEventListener("input", () => {
     slugTouched = true;
   });
+  ["click", "keyup", "select"].forEach((eventName) => {
+    contentInput.addEventListener(eventName, rememberInsertionRange);
+  });
   form.addEventListener("input", () => {
     updatePreview();
     syncDirtyState();
@@ -325,10 +593,57 @@ export async function renderEditor(context) {
     save(false);
   });
   form.querySelector('[data-save="draft"]').addEventListener("click", () => save(true));
+  form.querySelector("[data-insert-image]").addEventListener("click", openImageDialog);
+  imageForm.querySelector("[data-choose-image]").addEventListener("click", () => imageFileInput.click());
+  imageForm.querySelector("[data-replace-image]").addEventListener("click", () => imageFileInput.click());
+  imageFileInput.addEventListener("change", () => selectImage(imageFileInput.files?.[0]));
+  imageAltInput.addEventListener("input", () => {
+    imagePreviewImg.alt = imageAltInput.value.trim() || "待上传图片预览";
+    imageAltError.textContent = "";
+    imageAltError.classList.add("is-hidden");
+  });
+  imageForm.addEventListener("submit", uploadImage);
+  imageDialog.querySelectorAll("[data-close-image-dialog]").forEach((button) => {
+    button.addEventListener("click", closeImageDialog);
+  });
+  imageDialog.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closeImageDialog();
+  });
 
   updatePreview();
   baseline = snapshot();
   syncDirtyState();
+
+  return () => {
+    uploadController?.abort();
+    revokeImagePreview();
+  };
+}
+
+function formatFileSize(bytes) {
+  const size = Number(bytes);
+  if (!Number.isFinite(size) || size < 0) return "未知大小";
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 ** 2) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / 1024 ** 2).toFixed(1)} MB`;
+}
+
+function extractImageUrl(markdown) {
+  const match = String(markdown || "").match(/^!\[[^\]]*\]\(([^)]+)\)$/);
+  return match?.[1] || "";
+}
+
+function validateUploadedImageUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) throw new Error("上传接口没有返回图片地址。");
+  const url = new URL(raw, window.location.origin);
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error("上传接口返回了无效的图片地址。");
+  }
+  return url.origin === window.location.origin
+    ? `${url.pathname}${url.search}${url.hash}`
+    : url.href;
 }
 
 function renderMarkdown(markdown) {
@@ -416,9 +731,20 @@ function renderMarkdown(markdown) {
 }
 
 function inlineMarkdown(value) {
-  return escapeHtml(value)
+  const imageTokens = [];
+  const withImageTokens = escapeHtml(value).replace(
+    /!\[((?:\\.|[^\]])*)\]\(((?:https?:\/\/|\/)[^)\s]+)\)/g,
+    (_, rawAlt, source) => {
+      const token = `\uE000${imageTokens.length}\uE001`;
+      const alt = rawAlt.replace(/\\([\\\]])/g, "$1");
+      imageTokens.push(`<img src="${source}" alt="${alt}" loading="lazy" decoding="async">`);
+      return token;
+    },
+  );
+  return withImageTokens
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/\*([^*]+)\*/g, "<em>$1</em>")
-    .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/\uE000(\d+)\uE001/g, (_, index) => imageTokens[Number(index)] || "");
 }

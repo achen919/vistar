@@ -79,6 +79,68 @@ async function request(path, options = {}) {
   return payload ?? {};
 }
 
+function reportUploadProgress(callback, value) {
+  if (typeof callback !== "function") return;
+  try {
+    callback(value);
+  } catch {
+    // Upload progress is presentational and must not break the request.
+  }
+}
+
+async function uploadImage(file, signal, onProgress) {
+  if (!file || typeof file.name !== "string") {
+    throw new ApiError("请选择要上传的图片。");
+  }
+  const form = new FormData();
+  form.append("file", file, file.name);
+  reportUploadProgress(onProgress, 0);
+
+  let response;
+  try {
+    response = await fetch(`${API_BASE}/uploads/images`, {
+      method: "POST",
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+        "X-CSRF-Token": csrfToken,
+      },
+      body: form,
+      signal,
+    });
+  } catch (error) {
+    if (error.name === "AbortError") throw error;
+    throw new ApiError("图片上传失败，请检查网络后重试。");
+  }
+
+  const contentType = response.headers.get("Content-Type") || "";
+  let payload = null;
+  try {
+    if (contentType.includes("application/json")) {
+      payload = await response.json();
+    } else {
+      await response.text();
+    }
+  } catch {
+    payload = null;
+  }
+  captureCsrf(response, payload);
+
+  if (!response.ok) {
+    const error = new ApiError(
+      payload?.error || `图片上传失败（${response.status}）`,
+      response.status,
+      payload,
+    );
+    if (response.status === 401 && unauthorizedHandler) {
+      unauthorizedHandler(error);
+    }
+    throw error;
+  }
+  reportUploadProgress(onProgress, 100);
+  return payload ?? {};
+}
+
 export const api = {
   session(signal) {
     return request("/session", { signal, notifyUnauthorized: false });
@@ -134,5 +196,33 @@ export const api = {
   },
   stats(days, signal) {
     return request(`/stats?days=${encodeURIComponent(days)}`, { signal });
+  },
+  uploadImage(file, signal, onProgress) {
+    return uploadImage(file, signal, onProgress);
+  },
+  todos(date, signal) {
+    const query = date ? `?date=${encodeURIComponent(date)}` : "";
+    return request(`/todos${query}`, { signal });
+  },
+  todoStats(signal, days = 30, endDate = "") {
+    const params = new URLSearchParams({ days: String(days) });
+    if (endDate) params.set("endDate", endDate);
+    return request(`/todos/stats?${params}`, { signal });
+  },
+  createTodo(todo, signal) {
+    return request("/todos", { method: "POST", body: todo, signal });
+  },
+  updateTodo(identifier, todo, signal) {
+    return request(`/todos/${encodeURIComponent(identifier)}`, {
+      method: "PUT",
+      body: todo,
+      signal,
+    });
+  },
+  deleteTodo(identifier, signal) {
+    return request(`/todos/${encodeURIComponent(identifier)}`, {
+      method: "DELETE",
+      signal,
+    });
   },
 };

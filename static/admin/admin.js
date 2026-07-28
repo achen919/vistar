@@ -3,10 +3,10 @@ import {
   ApiError,
   clearCsrfToken,
   setUnauthorizedHandler,
-} from "./api.js?v=20260728-console-2";
-import { escapeHtml, icon } from "./ui.js?v=20260728-console-2";
+} from "./api.js?v=20260728-console-3";
+import { escapeHtml, icon } from "./ui.js?v=20260728-console-3";
 
-const ASSET_VERSION = "20260728-console-2";
+const ASSET_VERSION = "20260728-console-3";
 const app = document.querySelector("#app");
 const confirmDialog = document.querySelector("#globalConfirmDialog");
 const toastRegion = document.querySelector("#toastRegion");
@@ -14,44 +14,58 @@ const toastRegion = document.querySelector("#toastRegion");
 const routes = [
   {
     match: /^\/admin\/?$/,
+    section: "dashboard",
     title: "仪表盘",
     description: "博客运营概览",
-    load: () => import("./pages/dashboard.js?v=20260728-console-2")
+    load: () => import("./pages/dashboard.js?v=20260728-console-3")
       .then((module) => module.renderDashboard),
   },
   {
     match: /^\/admin\/articles\/?$/,
+    section: "articles",
     title: "文章管理",
     description: "管理全部内容与发布状态",
-    load: () => import("./pages/articles.js?v=20260728-console-2")
+    load: () => import("./pages/articles.js?v=20260728-console-3")
       .then((module) => module.renderArticles),
   },
   {
     match: /^\/admin\/articles\/new\/?$/,
+    section: "articles",
     title: "新建文章",
     description: "撰写并发布新的博客内容",
-    load: () => import("./pages/editor.js?v=20260728-console-2")
+    load: () => import("./pages/editor.js?v=20260728-console-3")
       .then((module) => module.renderEditor),
   },
   {
     match: /^\/admin\/articles\/edit\/?$/,
+    section: "articles",
     title: "编辑文章",
     description: "修改文章内容与发布状态",
-    load: () => import("./pages/editor.js?v=20260728-console-2")
+    load: () => import("./pages/editor.js?v=20260728-console-3")
       .then((module) => module.renderEditor),
   },
   {
     match: /^\/admin\/categories\/?$/,
+    section: "categories",
     title: "分类管理",
     description: "维护分类并调整前台展示顺序",
-    load: () => import("./pages/categories.js?v=20260728-console-2")
+    load: () => import("./pages/categories.js?v=20260728-console-3")
       .then((module) => module.renderCategories),
   },
   {
+    match: /^\/admin\/todos\/?$/,
+    section: "todos",
+    title: "每日 Todo",
+    description: "规划今日事项并回顾每日完成情况",
+    load: () => import("./pages/todos.js?v=20260728-console-3")
+      .then((module) => module.renderTodos),
+  },
+  {
     match: /^\/admin\/analytics\/?$/,
+    section: "analytics",
     title: "数据统计",
     description: "查看网站访问与内容表现",
-    load: () => import("./pages/analytics.js?v=20260728-console-2")
+    load: () => import("./pages/analytics.js?v=20260728-console-3")
       .then((module) => module.renderAnalytics),
   },
 ];
@@ -186,6 +200,8 @@ function renderShell() {
           <p class="nav-section-label">内容管理</p>
           <a href="/admin/articles/" data-route data-nav="articles">${icon("articles")}<span>文章管理</span></a>
           <a href="/admin/categories/" data-route data-nav="categories">${icon("categories")}<span>分类管理</span></a>
+          <p class="nav-section-label">个人效率</p>
+          <a href="/admin/todos/" data-route data-nav="todos">${icon("todos")}<span>每日 Todo</span></a>
           <p class="nav-section-label">运营分析</p>
           <a href="/admin/analytics/" data-route data-nav="analytics">${icon("analytics")}<span>数据统计</span></a>
         </nav>
@@ -282,13 +298,7 @@ async function ensureCurrentAssetVersion(signal) {
 }
 
 function updateNavigation(route) {
-  const section = route?.match === routes[0].match
-    ? "dashboard"
-    : route?.match === routes[4].match
-      ? "categories"
-      : route?.match === routes[5].match
-        ? "analytics"
-        : "articles";
+  const section = route?.section || "";
   app.querySelectorAll("[data-nav]").forEach((link) => {
     const active = link.dataset.nav === section;
     link.classList.toggle("active", active);

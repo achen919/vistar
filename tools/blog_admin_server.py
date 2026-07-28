@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Private management API for the Hugo site.
 
-The service intentionally uses only the Python standard library. Nginx serves
-the static admin shell and proxies ``/admin/api/`` to this localhost process.
-Authentication is enforced again in this process so a reverse-proxy mistake
-does not expose content publishing.
+The service uses the Python standard library plus Pillow for safely decoding
+and normalizing uploaded images. Nginx serves the static admin shell and proxies
+``/admin/api/`` to this localhost process. Authentication is enforced again in
+this process so a reverse-proxy mistake does not expose content publishing.
 """
 
 from __future__ import annotations
@@ -12,8 +12,11 @@ from __future__ import annotations
 import ast
 import base64
 import datetime as dt
+import email.policy
+import fcntl
 import hashlib
 import hmac
+import io
 import ipaddress
 import json
 import logging
@@ -28,20 +31,32 @@ import tempfile
 import threading
 import time
 import tomllib
+import warnings
 from collections import Counter, defaultdict
+from contextlib import contextmanager
+from email.parser import BytesParser
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 from zoneinfo import ZoneInfo
+
+from PIL import Image, ImageOps
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BRANCH = "main"
 REQUEST_LIMIT_BYTES = 2 * 1024 * 1024
 LOGIN_REQUEST_LIMIT_BYTES = 16 * 1024
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+IMAGE_MULTIPART_OVERHEAD_BYTES = 64 * 1024
+MAX_IMAGE_WIDTH = 8_192
+MAX_IMAGE_HEIGHT = 8_192
+MAX_IMAGE_PIXELS = 24_000_000
+MAX_IMAGE_FRAMES = 60
+MAX_IMAGE_TOTAL_PIXELS = 48_000_000
 SESSION_COOKIE = "blog_admin_session"
 SESSION_TTL_SECONDS = 12 * 60 * 60
 LOGIN_WINDOW_SECONDS = 15 * 60
@@ -49,6 +64,9 @@ LOGIN_MAX_FAILURES = 5
 SOURCE_SYNC_INTERVAL_SECONDS = 30
 MAX_CATEGORY_COUNT = 100
 MAX_STATS_DAYS = 365
+MAX_TODO_COUNT = 10_000
+MAX_TODO_TITLE_CHARACTERS = 200
+MAX_TODO_TITLE_BYTES = 800
 CATEGORY_HEADER = "[[params.blogCategories]]"
 CONFIG_SECTION_RE = re.compile(r"^\s*\[")
 FRONT_MATTER_FIELD_RE = re.compile(r"^([A-Za-z0-9_-]+)\s*:")
@@ -84,11 +102,37 @@ STATIC_SUFFIXES = {
     ".woff2",
     ".xml",
 }
+IMAGE_EXTENSIONS = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+IMAGE_CANONICAL_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
+PILLOW_IMAGE_FORMATS = {
+    "image/png": "PNG",
+    "image/jpeg": "JPEG",
+    "image/gif": "GIF",
+    "image/webp": "WEBP",
+}
+TODO_ID_RE = re.compile(r"^todo_[A-Za-z0-9_-]{16,64}$")
+TODO_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
+)
+TODO_STATE_VERSION = 1
 
 logger = logging.getLogger("blog_admin")
 publish_lock = threading.RLock()
 source_sync_lock = threading.RLock()
 login_lock = threading.RLock()
+todo_lock = threading.RLock()
+image_processing_lock = threading.Lock()
 audit_lock = threading.Lock()
 stats_lock = threading.Lock()
 stats_refresh_lock = threading.Lock()
@@ -140,6 +184,20 @@ def should_update_submodules() -> bool:
 
 def analytics_log_path() -> Path:
     return Path(env("BLOG_ADMIN_ACCESS_LOG", "/www/wwwlogs/blog.log")).resolve()
+
+
+def todo_state_path() -> Path:
+    return Path(
+        env("BLOG_ADMIN_TODO_FILE", "/var/lib/blog-admin/todos.json")
+    ).resolve()
+
+
+def image_upload_max_bytes() -> int:
+    try:
+        configured = int(env("BLOG_ADMIN_UPLOAD_MAX_BYTES", str(MAX_IMAGE_BYTES)))
+    except ValueError:
+        configured = MAX_IMAGE_BYTES
+    return max(64 * 1024, min(configured, MAX_IMAGE_BYTES))
 
 
 def timezone() -> ZoneInfo:
@@ -200,7 +258,15 @@ def run(
 
 def git_status(root: Path) -> str:
     return run(
-        ["git", "status", "--porcelain", "--", "hugo.toml", "content"],
+        [
+            "git",
+            "status",
+            "--porcelain",
+            "--",
+            "hugo.toml",
+            "content",
+            "static/uploads",
+        ],
         root,
         proc_env=git_env(),
         public_message="无法检查内容仓库状态。",
@@ -1067,8 +1133,11 @@ class ContentSnapshot:
         self.targets = targets
         self.sealed = False
         self.files: dict[str, bytes] = {}
+        self.existing_targets: set[str] = set()
         for target_name in targets:
             target = root / target_name
+            if target.exists():
+                self.existing_targets.add(target_name)
             if target.is_file():
                 self.files[target_name] = target.read_bytes()
             elif target.is_dir():
@@ -1094,6 +1163,11 @@ class ContentSnapshot:
                 ):
                     try:
                         directory.rmdir()
+                    except OSError:
+                        pass
+                if target_name not in self.existing_targets:
+                    try:
+                        target.rmdir()
                     except OSError:
                         pass
         for relative, content in self.files.items():
@@ -1482,6 +1556,622 @@ def publish(payload: dict[str, Any]) -> dict[str, Any]:
         current = get_post(root, slug)
         return update_post(slug, {**payload, "version": current["version"]})
     return create_post(payload)
+
+
+def validate_image_dimensions(width: int, height: int, *, frames: int) -> None:
+    if (
+        width <= 0
+        or height <= 0
+        or width > MAX_IMAGE_WIDTH
+        or height > MAX_IMAGE_HEIGHT
+        or width * height > MAX_IMAGE_PIXELS
+        or width * height * frames > MAX_IMAGE_TOTAL_PIXELS
+    ):
+        raise BlogAdminError(
+            "图片尺寸或动画总像素数超过安全上限。",
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            code="image_dimensions_too_large",
+        )
+
+
+def normalized_frame(image: Image.Image, *, preserve_alpha: bool) -> Image.Image:
+    oriented = ImageOps.exif_transpose(image)
+    has_alpha = (
+        "A" in oriented.getbands()
+        or "transparency" in oriented.info
+    )
+    converted = oriented.convert("RGBA" if preserve_alpha and has_alpha else "RGB")
+    converted.info.clear()
+    return converted
+
+
+def encode_verified_image(
+    image: Image.Image,
+    *,
+    mime_type: str,
+    frames: int,
+) -> bytes:
+    output = io.BytesIO()
+    if mime_type == "image/jpeg":
+        frame = normalized_frame(image, preserve_alpha=False)
+        frame.save(output, format="JPEG", quality=90, progressive=True)
+    elif mime_type == "image/png":
+        frame = normalized_frame(image, preserve_alpha=True)
+        frame.save(output, format="PNG", compress_level=6)
+    elif mime_type == "image/webp":
+        if frames != 1:
+            raise BlogAdminError(
+                "暂不支持上传动态 WebP。",
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                code="unsupported_image_animation",
+            )
+        frame = normalized_frame(image, preserve_alpha=True)
+        frame.save(output, format="WEBP", quality=88, method=4)
+    elif mime_type == "image/gif":
+        safe_frames: list[Image.Image] = []
+        durations: list[int] = []
+        for index in range(frames):
+            image.seek(index)
+            image.load()
+            safe_frames.append(normalized_frame(image, preserve_alpha=True))
+            raw_duration = image.info.get("duration", 100)
+            duration = raw_duration if isinstance(raw_duration, int) else 100
+            durations.append(max(20, min(duration, 60_000)))
+        raw_loop = image.info.get("loop", 0)
+        loop = raw_loop if isinstance(raw_loop, int) and 0 <= raw_loop <= 65_535 else 0
+        safe_frames[0].save(
+            output,
+            format="GIF",
+            save_all=frames > 1,
+            append_images=safe_frames[1:],
+            duration=durations,
+            loop=loop,
+            disposal=2,
+        )
+    else:
+        raise BlogAdminError(
+            "图片格式不受支持。",
+            HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            code="unsupported_image_type",
+        )
+    return output.getvalue()
+
+
+def decode_and_normalize_image(content: bytes, expected_mime: str) -> bytes:
+    expected_format = PILLOW_IMAGE_FORMATS[expected_mime]
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(content)) as verification:
+                if verification.format != expected_format:
+                    raise BlogAdminError(
+                        "图片内容与声明的类型不一致。",
+                        HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                        code="invalid_image_content",
+                    )
+                validate_image_dimensions(*verification.size, frames=1)
+                verification.verify()
+
+            with Image.open(io.BytesIO(content)) as image:
+                if image.format != expected_format:
+                    raise BlogAdminError(
+                        "图片内容与声明的类型不一致。",
+                        HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                        code="invalid_image_content",
+                    )
+                frames = 0
+                total_pixels = 0
+                while True:
+                    try:
+                        image.seek(frames)
+                    except EOFError:
+                        break
+                    frames += 1
+                    if frames > MAX_IMAGE_FRAMES:
+                        raise BlogAdminError(
+                            f"动态图片不能超过 {MAX_IMAGE_FRAMES} 帧。",
+                            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            code="image_too_many_frames",
+                        )
+                    validate_image_dimensions(*image.size, frames=1)
+                    total_pixels += image.width * image.height
+                    if total_pixels > MAX_IMAGE_TOTAL_PIXELS:
+                        raise BlogAdminError(
+                            "动画总像素数超过安全上限。",
+                            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            code="image_dimensions_too_large",
+                        )
+                    image.load()
+                if frames == 0:
+                    raise BlogAdminError(
+                        "图片不包含可解码的画面。",
+                        HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                        code="invalid_image_content",
+                    )
+                image.seek(0)
+                normalized = encode_verified_image(
+                    image,
+                    mime_type=expected_mime,
+                    frames=frames,
+                )
+    except BlogAdminError:
+        raise
+    except Exception as exc:
+        raise BlogAdminError(
+            "图片内容与声明的类型不一致或文件已损坏。",
+            HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            code="invalid_image_content",
+        ) from exc
+    if not normalized or len(normalized) > image_upload_max_bytes():
+        raise BlogAdminError(
+            "图片安全处理后的大小超过上传上限。",
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            code="image_too_large",
+        )
+    return normalized
+
+
+def validate_image_upload(
+    filename: str, declared_mime: str, content: bytes
+) -> tuple[str, str, bytes]:
+    if (
+        not isinstance(filename, str)
+        or not filename
+        or filename != filename.strip()
+        or filename.startswith(".")
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+        or any(ord(character) < 32 or ord(character) == 127 for character in filename)
+        or len(filename) > 180
+        or len(filename.encode("utf-8")) > 240
+    ):
+        raise BlogAdminError("图片文件名无效。", code="invalid_image_filename")
+    extension = Path(filename).suffix.lower()
+    if not extension or extension not in IMAGE_EXTENSIONS:
+        raise BlogAdminError(
+            "仅支持 PNG、JPEG、GIF 和 WebP 图片。",
+            HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            code="unsupported_image_type",
+        )
+    if not filename[: -len(extension)].strip():
+        raise BlogAdminError("图片文件名无效。", code="invalid_image_filename")
+    supplied_mime = declared_mime.split(";", 1)[0].strip().lower()
+    expected_mime = IMAGE_EXTENSIONS[extension]
+    if supplied_mime != expected_mime:
+        raise BlogAdminError(
+            "图片扩展名与 MIME 类型不一致。",
+            HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            code="image_type_mismatch",
+        )
+    if not content:
+        raise BlogAdminError("图片内容不能为空。", code="empty_image")
+    if len(content) > image_upload_max_bytes():
+        raise BlogAdminError(
+            "图片不能超过 5 MiB。",
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            code="image_too_large",
+        )
+    with image_processing_lock:
+        normalized = decode_and_normalize_image(content, expected_mime)
+    return (
+        expected_mime,
+        IMAGE_CANONICAL_EXTENSIONS[expected_mime],
+        normalized,
+    )
+
+
+def atomic_write_bytes(path: Path, content: bytes, *, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def image_markdown_alt(filename: str) -> str:
+    alt = Path(filename).stem.strip() or "图片"
+    return alt.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def upload_image(filename: str, declared_mime: str, content: bytes) -> dict[str, Any]:
+    mime_type, extension, normalized = validate_image_upload(
+        filename, declared_mime, content
+    )
+    with publish_lock:
+        root = ensure_source_repo(force=True)
+        ensure_content_clean(root)
+        require_publish_queue_empty(root)
+        now = dt.datetime.now(timezone())
+        relative = (
+            Path("static")
+            / "uploads"
+            / f"{now.year:04d}"
+            / f"{now.month:02d}"
+            / f"{secrets.token_hex(18)}{extension}"
+        )
+        destination = (root / relative).resolve()
+        upload_root = (root / "static" / "uploads").resolve()
+        if upload_root not in destination.parents:
+            raise BlogAdminError(
+                "图片存储路径无效。",
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                code="invalid_upload_path",
+            )
+        if destination.exists():
+            raise BlogAdminError(
+                "图片存储冲突，请重试。",
+                HTTPStatus.CONFLICT,
+                code="upload_conflict",
+            )
+        relative_name = relative.as_posix()
+        snapshot = ContentSnapshot(root, [relative_name])
+        try:
+            atomic_write_bytes(destination, normalized)
+            commit = finish_content_change(
+                root,
+                snapshot,
+                message=f"Upload blog image: {destination.name}",
+                paths=[relative_name],
+            )
+        except Exception:
+            snapshot.restore()
+            raise
+        public_path = relative.relative_to("static").as_posix()
+        url = f"/{public_path}"
+        return {
+            "url": url,
+            "markdown": f"![{image_markdown_alt(filename)}]({url})",
+            "filename": destination.name,
+            "mimeType": mime_type,
+            "size": len(normalized),
+            "commit": commit,
+        }
+
+
+def validate_todo_date(value: Any, *, default_today: bool = False) -> str:
+    if value is None and default_today:
+        return dt.datetime.now(timezone()).date().isoformat()
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise BlogAdminError("Todo 日期无效。", code="invalid_todo_date")
+    try:
+        parsed = dt.date.fromisoformat(value)
+    except ValueError as exc:
+        raise BlogAdminError("Todo 日期无效。", code="invalid_todo_date") from exc
+    if not 2000 <= parsed.year <= 2100:
+        raise BlogAdminError(
+            "Todo 日期必须在 2000 到 2100 年之间。",
+            code="invalid_todo_date",
+        )
+    return parsed.isoformat()
+
+
+def validate_todo_title(value: Any) -> str:
+    if not isinstance(value, str):
+        raise BlogAdminError("Todo 内容必须是字符串。", code="invalid_todo_title")
+    title = value.strip()
+    if (
+        not title
+        or len(title) > MAX_TODO_TITLE_CHARACTERS
+        or len(title.encode("utf-8")) > MAX_TODO_TITLE_BYTES
+        or any(ord(character) < 32 or ord(character) == 127 for character in title)
+    ):
+        raise BlogAdminError(
+            "Todo 内容不能为空、不能包含控制字符，且不能超过 200 个字符。",
+            code="invalid_todo_title",
+        )
+    return title
+
+
+def validate_todo_id(value: Any) -> str:
+    if not isinstance(value, str) or not TODO_ID_RE.fullmatch(value):
+        raise BlogAdminError("Todo ID 无效。", code="invalid_todo_id")
+    return value
+
+
+def validate_todo_timestamp(value: Any, *, nullable: bool = False) -> str | None:
+    if value is None and nullable:
+        return None
+    if not isinstance(value, str) or not TODO_TIMESTAMP_RE.fullmatch(value):
+        raise ValueError("invalid todo timestamp")
+    parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.utcoffset() != dt.timedelta(0):
+        raise ValueError("todo timestamp must use UTC")
+    return value
+
+
+def normalize_stored_todo(raw: Any) -> dict[str, Any]:
+    expected_keys = {
+        "id",
+        "title",
+        "date",
+        "completed",
+        "createdAt",
+        "updatedAt",
+        "completedAt",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected_keys:
+        raise ValueError("invalid todo record schema")
+    completed = raw["completed"]
+    if not isinstance(completed, bool):
+        raise ValueError("invalid todo completion state")
+    created_at = validate_todo_timestamp(raw["createdAt"])
+    updated_at = validate_todo_timestamp(raw["updatedAt"])
+    completed_at = validate_todo_timestamp(raw["completedAt"], nullable=True)
+    if completed != (completed_at is not None):
+        raise ValueError("todo completion timestamp does not match state")
+    created_stamp = dt.datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    updated_stamp = dt.datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+    if updated_stamp < created_stamp:
+        raise ValueError("todo updatedAt predates createdAt")
+    if (
+        completed_at is not None
+        and dt.datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+        < created_stamp
+    ):
+        raise ValueError("todo completedAt predates createdAt")
+    return {
+        "id": validate_todo_id(raw["id"]),
+        "title": validate_todo_title(raw["title"]),
+        "date": validate_todo_date(raw["date"]),
+        "completed": completed,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+        "completedAt": completed_at,
+    }
+
+
+def _todo_store_error(detail: str) -> BlogAdminError:
+    return BlogAdminError(
+        "Todo 数据暂时无法读取，请联系管理员检查状态文件。",
+        HTTPStatus.INTERNAL_SERVER_ERROR,
+        code="todo_store_invalid",
+        detail=detail,
+    )
+
+
+@contextmanager
+def locked_todo_store():
+    path = todo_state_path()
+    descriptor: int | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path = path.parent / f".{path.name}.lock"
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        os.fchmod(descriptor, 0o600)
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise _todo_store_error(str(exc)) from exc
+    assert descriptor is not None
+    with todo_lock, os.fdopen(descriptor, "a+b") as handle:
+        acquired = False
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            acquired = True
+            yield path
+        except OSError as exc:
+            raise _todo_store_error(str(exc)) from exc
+        finally:
+            if acquired:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    logger.exception("unable to release todo store lock")
+
+
+def load_todo_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"version": TODO_STATE_VERSION, "todos": []}
+    try:
+        if path.stat().st_size > 16 * 1024 * 1024:
+            raise ValueError("todo state file is too large")
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != {"version", "todos"}
+            or raw["version"] != TODO_STATE_VERSION
+            or not isinstance(raw["todos"], list)
+            or len(raw["todos"]) > MAX_TODO_COUNT
+        ):
+            raise ValueError("invalid todo state schema")
+        todos = [normalize_stored_todo(item) for item in raw["todos"]]
+        identifiers = [item["id"] for item in todos]
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("duplicate todo identifiers")
+        return {"version": TODO_STATE_VERSION, "todos": todos}
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+        BlogAdminError,
+    ) as exc:
+        raise _todo_store_error(str(exc)) from exc
+
+
+def write_todo_state(path: Path, state: dict[str, Any]) -> None:
+    content = (
+        json.dumps(
+            state,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    atomic_write_bytes(path, content, mode=0o600)
+
+
+def todo_summary(todos: list[dict[str, Any]]) -> dict[str, int]:
+    total = len(todos)
+    completed = sum(1 for item in todos if item["completed"])
+    return {
+        "total": total,
+        "completed": completed,
+        "pending": total - completed,
+        "completionRate": round(completed * 100 / total) if total else 0,
+    }
+
+
+def list_todos(date_value: Any = None) -> dict[str, Any]:
+    selected_date = validate_todo_date(date_value, default_today=True)
+    with locked_todo_store() as path:
+        state = load_todo_state(path)
+        todos = [
+            item for item in state["todos"] if item["date"] == selected_date
+        ]
+    todos.sort(key=lambda item: (item["completed"], item["createdAt"], item["id"]))
+    return {
+        "date": selected_date,
+        "todos": todos,
+        "summary": todo_summary(todos),
+    }
+
+
+def create_todo(payload: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"title", "date", "completed"}
+    if set(payload) - allowed:
+        raise BlogAdminError("Todo 请求包含未知字段。", code="invalid_todo")
+    title = validate_todo_title(payload.get("title"))
+    date_value = validate_todo_date(payload.get("date"), default_today=True)
+    completed = payload.get("completed", False)
+    if not isinstance(completed, bool):
+        raise BlogAdminError("Todo 完成状态无效。", code="invalid_todo")
+    now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    todo = {
+        "id": f"todo_{secrets.token_urlsafe(18)}",
+        "title": title,
+        "date": date_value,
+        "completed": completed,
+        "createdAt": now,
+        "updatedAt": now,
+        "completedAt": now if completed else None,
+    }
+    with locked_todo_store() as path:
+        state = load_todo_state(path)
+        if len(state["todos"]) >= MAX_TODO_COUNT:
+            raise BlogAdminError(
+                "Todo 数量已达到上限。",
+                HTTPStatus.CONFLICT,
+                code="todo_limit_reached",
+            )
+        identifiers = {item["id"] for item in state["todos"]}
+        while todo["id"] in identifiers:
+            todo["id"] = f"todo_{secrets.token_urlsafe(18)}"
+        state["todos"].append(todo)
+        write_todo_state(path, state)
+    return todo
+
+
+def update_todo(identifier: str, payload: dict[str, Any]) -> dict[str, Any]:
+    todo_id = validate_todo_id(identifier)
+    allowed = {"title", "date", "completed"}
+    if not payload or set(payload) - allowed:
+        raise BlogAdminError(
+            "Todo 更新必须包含 title、date 或 completed。",
+            code="invalid_todo",
+        )
+    updates: dict[str, Any] = {}
+    if "title" in payload:
+        updates["title"] = validate_todo_title(payload["title"])
+    if "date" in payload:
+        updates["date"] = validate_todo_date(payload["date"])
+    if "completed" in payload:
+        if not isinstance(payload["completed"], bool):
+            raise BlogAdminError("Todo 完成状态无效。", code="invalid_todo")
+        updates["completed"] = payload["completed"]
+    with locked_todo_store() as path:
+        state = load_todo_state(path)
+        todo = next(
+            (item for item in state["todos"] if item["id"] == todo_id),
+            None,
+        )
+        if todo is None:
+            raise BlogAdminError(
+                "Todo 不存在。", HTTPStatus.NOT_FOUND, code="todo_not_found"
+            )
+        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        was_completed = todo["completed"]
+        todo.update(updates)
+        if "completed" in updates and todo["completed"] != was_completed:
+            todo["completedAt"] = now if todo["completed"] else None
+        todo["updatedAt"] = now
+        write_todo_state(path, state)
+        return dict(todo)
+
+
+def delete_todo(identifier: str) -> dict[str, Any]:
+    todo_id = validate_todo_id(identifier)
+    with locked_todo_store() as path:
+        state = load_todo_state(path)
+        original_count = len(state["todos"])
+        state["todos"] = [
+            item for item in state["todos"] if item["id"] != todo_id
+        ]
+        if len(state["todos"]) == original_count:
+            raise BlogAdminError(
+                "Todo 不存在。", HTTPStatus.NOT_FOUND, code="todo_not_found"
+            )
+        write_todo_state(path, state)
+    return {"ok": True, "id": todo_id}
+
+
+def todo_stats(days: int = 30, end_date: Any = None) -> dict[str, Any]:
+    if not 1 <= days <= MAX_STATS_DAYS:
+        raise BlogAdminError(
+            f"days 必须在 1 到 {MAX_STATS_DAYS} 之间。",
+            code="invalid_days",
+        )
+    selected_end = dt.date.fromisoformat(
+        validate_todo_date(end_date, default_today=True)
+    )
+    selected_days = [
+        (selected_end - dt.timedelta(days=offset)).isoformat()
+        for offset in reversed(range(days))
+    ]
+    selected = set(selected_days)
+    with locked_todo_store() as path:
+        state = load_todo_state(path)
+        by_date: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in state["todos"]:
+            if item["date"] in selected:
+                by_date[item["date"]].append(item)
+    daily = [
+        {"date": date_value, **todo_summary(by_date.get(date_value, []))}
+        for date_value in selected_days
+    ]
+    total = sum(item["total"] for item in daily)
+    completed = sum(item["completed"] for item in daily)
+    totals = {
+        "total": total,
+        "completed": completed,
+        "pending": total - completed,
+        "completionRate": round(completed * 100 / total) if total else 0,
+        "activeDays": sum(1 for item in daily if item["total"]),
+        "perfectDays": sum(
+            1
+            for item in daily
+            if item["total"] and item["completed"] == item["total"]
+        ),
+    }
+    return {
+        "days": days,
+        "startDate": selected_days[0],
+        "endDate": selected_days[-1],
+        "totals": totals,
+        "daily": daily,
+    }
 
 
 def _b64encode(value: bytes) -> str:
@@ -2046,6 +2736,79 @@ class Handler(BaseHTTPRequestHandler):
             raise BlogAdminError("JSON 请求体必须是对象。", code="invalid_json")
         return payload
 
+    def read_multipart_image(self) -> tuple[str, str, bytes]:
+        content_type = self.headers.get("Content-Type", "")
+        if len(content_type) > 512 or not content_type.lower().startswith(
+            "multipart/form-data"
+        ):
+            raise BlogAdminError(
+                "图片上传必须使用 multipart/form-data。",
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                code="invalid_content_type",
+            )
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError as exc:
+            raise BlogAdminError(
+                "Content-Length 无效。", code="invalid_request"
+            ) from exc
+        request_limit = image_upload_max_bytes() + IMAGE_MULTIPART_OVERHEAD_BYTES
+        if length <= 0:
+            raise BlogAdminError("请求体不能为空。", code="invalid_request")
+        if length > request_limit:
+            raise BlogAdminError(
+                "图片上传请求过大。",
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                code="request_too_large",
+            )
+        raw = self.rfile.read(length)
+        if len(raw) != length:
+            raise BlogAdminError("请求体不完整。", code="invalid_request")
+        try:
+            message = BytesParser(policy=email.policy.default).parsebytes(
+                b"Content-Type: "
+                + content_type.encode("ascii")
+                + b"\r\nMIME-Version: 1.0\r\n\r\n"
+                + raw
+            )
+        except (UnicodeEncodeError, ValueError) as exc:
+            raise BlogAdminError(
+                "multipart 请求格式无效。", code="invalid_multipart"
+            ) from exc
+        if not message.is_multipart() or message.defects:
+            raise BlogAdminError(
+                "multipart 请求格式无效。", code="invalid_multipart"
+            )
+        parts = list(message.iter_parts())
+        if len(parts) != 1:
+            raise BlogAdminError(
+                "图片上传只能包含一个 file 字段。",
+                code="invalid_multipart",
+            )
+        part = parts[0]
+        if (
+            part.is_multipart()
+            or part.defects
+            or part.get_content_disposition() != "form-data"
+            or part.get_param("name", header="content-disposition") != "file"
+        ):
+            raise BlogAdminError(
+                "图片上传缺少有效的 file 字段。",
+                code="invalid_multipart",
+            )
+        transfer_encoding = (part.get("Content-Transfer-Encoding") or "").lower()
+        if transfer_encoding not in {"", "binary", "8bit"}:
+            raise BlogAdminError(
+                "图片传输编码不受支持。", code="invalid_multipart"
+            )
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True)
+        if not isinstance(filename, str) or not isinstance(payload, bytes):
+            raise BlogAdminError(
+                "图片上传缺少文件名或内容。", code="invalid_multipart"
+            )
+        return filename, part.get_content_type().lower(), payload
+
     def current_session(self) -> dict[str, Any] | None:
         cookie = SimpleCookie()
         try:
@@ -2101,6 +2864,13 @@ class Handler(BaseHTTPRequestHandler):
             return None
         value = unquote(path[len(prefix) :])
         return validate_slug(value) if value else None
+
+    def todo_id_from_path(self, path: str) -> str | None:
+        prefix = "/api/todos/"
+        if not path.startswith(prefix):
+            return None
+        value = unquote(path[len(prefix) :])
+        return validate_todo_id(value) if value else None
 
     def handle_login(self) -> None:
         client_ip = self.client_ip()
@@ -2240,6 +3010,81 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET" and path == "/api/overview":
             self.send_json(HTTPStatus.OK, overview_payload(root_for_read()))
             return
+        if method == "POST" and path == "/api/uploads/images":
+            filename, mime_type, content = self.read_multipart_image()
+            payload = upload_image(filename, mime_type, content)
+            audit_event(
+                "image.upload",
+                user=user,
+                target=payload["url"],
+                client_ip=client_ip,
+            )
+            self.send_json(HTTPStatus.CREATED, payload)
+            return
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if method == "GET" and path == "/api/todos/stats":
+            if set(query) - {"days", "endDate"} or any(
+                len(values) != 1 for values in query.values()
+            ):
+                raise BlogAdminError(
+                    "Todo 统计查询参数无效。", code="invalid_query"
+                )
+            try:
+                days = int(query.get("days", ["30"])[0])
+            except ValueError as exc:
+                raise BlogAdminError(
+                    "days 参数无效。", code="invalid_days"
+                ) from exc
+            end_date = query.get("endDate", [None])[0]
+            self.send_json(HTTPStatus.OK, todo_stats(days, end_date))
+            return
+        if method == "GET" and path == "/api/todos":
+            if set(query) - {"date"} or any(
+                len(values) != 1 for values in query.values()
+            ):
+                raise BlogAdminError(
+                    "Todo 查询参数无效。", code="invalid_query"
+                )
+            date_value = query.get("date", [None])[0]
+            self.send_json(HTTPStatus.OK, list_todos(date_value))
+            return
+        if method == "POST" and path == "/api/todos":
+            payload = create_todo(self.read_json(limit=16 * 1024))
+            audit_event(
+                "todo.create",
+                user=user,
+                target=payload["id"],
+                client_ip=client_ip,
+            )
+            self.send_json(HTTPStatus.CREATED, payload)
+            return
+        todo_id = (
+            self.todo_id_from_path(path)
+            if path.startswith("/api/todos/")
+            else None
+        )
+        if method in {"PUT", "PATCH"} and todo_id:
+            payload = update_todo(
+                todo_id, self.read_json(limit=16 * 1024)
+            )
+            audit_event(
+                "todo.update",
+                user=user,
+                target=todo_id,
+                client_ip=client_ip,
+            )
+            self.send_json(HTTPStatus.OK, payload)
+            return
+        if method == "DELETE" and todo_id:
+            payload = delete_todo(todo_id)
+            audit_event(
+                "todo.delete",
+                user=user,
+                target=todo_id,
+                client_ip=client_ip,
+            )
+            self.send_json(HTTPStatus.OK, payload)
+            return
         if method == "GET" and path == "/api/posts":
             self.send_json(
                 HTTPStatus.OK, {"posts": list_posts(root_for_read())}
@@ -2362,6 +3207,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         self.handle_method("PUT")
+
+    def do_PATCH(self) -> None:
+        self.handle_method("PATCH")
 
     def do_DELETE(self) -> None:
         self.handle_method("DELETE")

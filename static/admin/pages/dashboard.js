@@ -9,7 +9,7 @@ import {
   renderTags,
   renderTrendChart,
   statusBadge,
-} from "../ui.js?v=20260728-console-2";
+} from "../ui.js?v=20260728-console-3";
 
 export async function renderDashboard(context) {
   const { api, container, signal } = context;
@@ -34,7 +34,7 @@ export async function renderDashboard(context) {
           <div class="panel-header">
             <div>
               <h2>快捷操作</h2>
-              <p>常用内容管理入口</p>
+              <p>常用管理入口</p>
             </div>
           </div>
           <div class="panel-body quick-actions">
@@ -46,6 +46,11 @@ export async function renderDashboard(context) {
             <a class="quick-action" href="/admin/categories/" data-route aria-label="管理分类，新增分类或调整展示顺序">
               <span class="metric-icon success">${icon("categories", 18)}</span>
               <span><strong>管理分类</strong><p>新增分类或调整展示顺序</p></span>
+              ${icon("chevronRight", 16)}
+            </a>
+            <a class="quick-action" href="/admin/todos/" data-route aria-label="每日 Todo，规划任务并查看完成情况">
+              <span class="metric-icon">${icon("todos", 18)}</span>
+              <span><strong>每日 Todo</strong><p>规划任务并查看完成情况</p></span>
               ${icon("chevronRight", 16)}
             </a>
             <a class="quick-action" href="/" target="_blank" rel="noopener noreferrer" aria-label="访问博客前台">
