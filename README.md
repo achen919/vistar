@@ -23,13 +23,19 @@ Build the static site:
 hugo --minify
 ```
 
-The generated `public/` directory is intentionally ignored. The server builds and serves `/www/wwwroot/blog/public`.
+The generated `public/` directory is intentionally ignored. Production builds
+into a release directory and atomically switches
+`/www/wwwroot/blog/public` to that release through a symbolic link.
 
 ## Automatic Deployment
 
 GitHub Actions deploys every push to `main`.
 
-The workflow checks out the repository with the PaperMod submodule, syncs the source to `/www/wwwroot/blog`, runs `hugo --gc --minify` on the server, and verifies `https://shcxyz.site/`.
+The workflow validates the admin module graph and tests, saves a recoverable
+source snapshot, syncs `/www/wwwroot/blog`, builds Hugo into a versioned public
+release, and switches the public symlink only after the admin service is
+healthy. Failed production checks restore both the previous static release and
+the previous server source before restarting the service.
 
 Required repository Secrets:
 
@@ -170,8 +176,9 @@ For an upgrade from the old Basic Auth console:
 4. Remove the old `.htpasswd-blog-admin` after verification.
 
 The installer deliberately does not overwrite a hosting panel's active Nginx
-vhost. It defaults `BLOG_ADMIN_UPDATE_SUBMODULES=0` and copies the already
-deployed PaperMod theme into the management checkout when needed.
+vhost. It always initializes the management checkout's own PaperMod submodule
+once. `BLOG_ADMIN_UPDATE_SUBMODULES=0` only skips repeated submodule updates
+during normal content synchronization.
 
 ## SSL
 

@@ -6,7 +6,7 @@ import {
   icon,
   loadingState,
   renderTrendChart,
-} from "../ui.js";
+} from "../ui.js?v=20260728-console-2";
 
 export async function renderAnalytics(context) {
   const { api, container, signal } = context;

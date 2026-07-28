@@ -408,6 +408,29 @@ if [[ -f "${LEGACY_HTPASSWD_FILE}" ]]; then
 fi
 
 GIT_SSH_COMMAND="ssh -F ${SSH_CONFIG}"
+repair_legacy_theme_checkout() {
+  local theme_dir="${BLOG_ADMIN_SOURCE_DIR}/themes/PaperMod"
+  local backup_dir
+
+  if [[ ! -e "${theme_dir}" ]]; then
+    return
+  fi
+  if [[ -e "${theme_dir}/.git" ]] && runuser -u "${BLOG_ADMIN_SERVICE_USER}" -- \
+    git -C "${theme_dir}" rev-parse --git-dir >/dev/null 2>&1; then
+    return
+  fi
+  if [[ -d "${theme_dir}" ]] && [[ -z "$(find "${theme_dir}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+    return
+  fi
+
+  backup_dir="${BLOG_ADMIN_STATE_DIR}/PaperMod.incomplete.$(date +%s).$$"
+  if [[ -e "${backup_dir}" ]]; then
+    echo "Refusing to overwrite PaperMod recovery directory: ${backup_dir}" >&2
+    exit 1
+  fi
+  mv "${theme_dir}" "${backup_dir}"
+}
+
 if [[ ! -d "${BLOG_ADMIN_SOURCE_DIR}/.git" ]]; then
   if [[ -e "${BLOG_ADMIN_SOURCE_DIR}" ]] && [[ -n "$(find "${BLOG_ADMIN_SOURCE_DIR}" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
     echo "${BLOG_ADMIN_SOURCE_DIR} exists and is not an empty Git repository." >&2
@@ -421,9 +444,14 @@ if [[ ! -d "${BLOG_ADMIN_SOURCE_DIR}/.git" ]]; then
   runuser -u "${BLOG_ADMIN_SERVICE_USER}" -- env \
     HOME="${BLOG_ADMIN_STATE_DIR}" \
     GIT_SSH_COMMAND="${GIT_SSH_COMMAND}" \
-    git clone --branch "${BLOG_ADMIN_BRANCH}" "${BLOG_ADMIN_REPO_URL}" "${BLOG_ADMIN_SOURCE_DIR}"
+    git clone \
+      --branch "${BLOG_ADMIN_BRANCH}" \
+      --recurse-submodules \
+      "${BLOG_ADMIN_REPO_URL}" \
+      "${BLOG_ADMIN_SOURCE_DIR}"
 else
   chown -R "${BLOG_ADMIN_SERVICE_USER}:${BLOG_ADMIN_SERVICE_USER}" "${BLOG_ADMIN_SOURCE_DIR}"
+  repair_legacy_theme_checkout
   runuser -u "${BLOG_ADMIN_SERVICE_USER}" -- \
     git -C "${BLOG_ADMIN_SOURCE_DIR}" remote set-url origin "${BLOG_ADMIN_REPO_URL}"
   runuser -u "${BLOG_ADMIN_SERVICE_USER}" -- env \
@@ -432,27 +460,14 @@ else
     git -C "${BLOG_ADMIN_SOURCE_DIR}" pull --ff-only origin "${BLOG_ADMIN_BRANCH}"
 fi
 
-if [[ "${BLOG_ADMIN_UPDATE_SUBMODULES}" != "0" ]]; then
-  runuser -u "${BLOG_ADMIN_SERVICE_USER}" -- env \
-    HOME="${BLOG_ADMIN_STATE_DIR}" \
-    GIT_SSH_COMMAND="${GIT_SSH_COMMAND}" \
-    git -C "${BLOG_ADMIN_SOURCE_DIR}" submodule update --init --recursive
-elif [[ -d "${BLOG_DEPLOY_DIR}/themes/PaperMod" && ! -f "${BLOG_ADMIN_SOURCE_DIR}/themes/PaperMod/theme.toml" ]]; then
-  install -d \
-    -o "${BLOG_ADMIN_SERVICE_USER}" \
-    -g "${BLOG_ADMIN_SERVICE_USER}" \
-    -m 750 \
-    "${BLOG_ADMIN_SOURCE_DIR}/themes"
-  if [[ -e "${BLOG_ADMIN_SOURCE_DIR}/themes/PaperMod" ]]; then
-    mv \
-      "${BLOG_ADMIN_SOURCE_DIR}/themes/PaperMod" \
-      "${BLOG_ADMIN_STATE_DIR}/PaperMod.incomplete.$(date +%s)"
-  fi
-  cp -a "${BLOG_DEPLOY_DIR}/themes/PaperMod" "${BLOG_ADMIN_SOURCE_DIR}/themes/PaperMod"
-  chown -R \
-    "${BLOG_ADMIN_SERVICE_USER}:${BLOG_ADMIN_SERVICE_USER}" \
-    "${BLOG_ADMIN_SOURCE_DIR}/themes/PaperMod"
-fi
+runuser -u "${BLOG_ADMIN_SERVICE_USER}" -- env \
+  HOME="${BLOG_ADMIN_STATE_DIR}" \
+  GIT_SSH_COMMAND="${GIT_SSH_COMMAND}" \
+  git -C "${BLOG_ADMIN_SOURCE_DIR}" submodule sync --recursive
+runuser -u "${BLOG_ADMIN_SERVICE_USER}" -- env \
+  HOME="${BLOG_ADMIN_STATE_DIR}" \
+  GIT_SSH_COMMAND="${GIT_SSH_COMMAND}" \
+  git -C "${BLOG_ADMIN_SOURCE_DIR}" submodule update --init --recursive
 
 install -m 644 \
   "${BLOG_DEPLOY_DIR}/deploy/systemd/blog-admin.service" \

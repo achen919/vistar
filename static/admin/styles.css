@@ -131,6 +131,10 @@ p {
   min-height: 100vh;
 }
 
+.no-js .js-boot-screen {
+  display: none;
+}
+
 .boot-screen,
 .page-loader {
   align-items: center;
@@ -143,6 +147,21 @@ p {
 
 .boot-screen {
   flex-direction: column;
+}
+
+.boot-failure {
+  padding: 24px;
+  text-align: center;
+}
+
+.boot-failure h1 {
+  color: var(--text);
+  font-size: 22px;
+  margin-top: 6px;
+}
+
+.boot-failure p {
+  max-width: 440px;
 }
 
 .brand-mark {

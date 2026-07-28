@@ -23,6 +23,17 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Validate admin code before deployment
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r -d '' javascript_file; do
+            node --check "$javascript_file"
+          done < <(find static/admin -type f -name '*.js' -print0)
+          node --experimental-vm-modules scripts/check-admin-modules.mjs
+          PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+          bash -n deploy/install-blog-admin.sh scripts/validate-blog-config.sh
+
       - name: Install deployment tools
         run: |
           sudo apt-get update
@@ -66,28 +77,62 @@ jobs:
 
           SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
+          RELEASE_ID="$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          SOURCE_BACKUP="/www/wwwroot/blog-source-rollbacks/$RELEASE_ID"
 
-          $SSH_CMD "$REMOTE" "
-            set -eu
-            if [ -L '$REMOTE_PATH' ]; then
-              echo 'Refusing symbolic-link deployment path: $REMOTE_PATH' >&2
-              exit 1
-            fi
-            mkdir -p '$REMOTE_PATH'
-            test -d '$REMOTE_PATH'
-          "
+          $SSH_CMD "$REMOTE" sh -s -- \
+            "$REMOTE_PATH" \
+            "$SOURCE_BACKUP" <<'BACKUP_SCRIPT'
+          set -eu
 
-          rsync -az --delete \
-            --exclude '.git/' \
-            --exclude '.github/' \
-            --exclude '.DS_Store' \
-            --exclude '.hugo_build.lock' \
-            --exclude 'public/' \
+          deploy_path="$1"
+          source_backup="$2"
+          if [ -L "$deploy_path" ]; then
+            echo "Refusing symbolic-link deployment path: $deploy_path" >&2
+            exit 1
+          fi
+          mkdir -p "$deploy_path" "$(dirname "$source_backup")"
+          test -d "$deploy_path"
+          if [ -e "$source_backup" ] || [ -L "$source_backup" ]; then
+            echo "Source rollback path already exists: $source_backup" >&2
+            exit 1
+          fi
+          mkdir "$source_backup"
+          rsync -a \
+            --exclude '.git' \
+            --exclude '/public' \
             --exclude 'resources/_gen/' \
-            -e "$SSH_CMD" \
-            ./ "$REMOTE:$REMOTE_PATH/"
+            "$deploy_path/" \
+            "$source_backup/"
+          BACKUP_SCRIPT
 
-      - name: Build site on server
+          if ! rsync -az --delete \
+              --exclude '.git' \
+              --exclude '.github/' \
+              --exclude '.DS_Store' \
+              --exclude '.hugo_build.lock' \
+              --exclude '/public' \
+              --exclude 'resources/_gen/' \
+              -e "$SSH_CMD" \
+              ./ "$REMOTE:$REMOTE_PATH/"; then
+            $SSH_CMD "$REMOTE" sh -s -- \
+              "$REMOTE_PATH" \
+              "$SOURCE_BACKUP" <<'RESTORE_SCRIPT'
+          set -eu
+          deploy_path="$1"
+          source_backup="$2"
+          test -d "$source_backup"
+          rsync -a --delete \
+            --exclude '.git' \
+            --exclude '/public' \
+            --exclude 'resources/_gen/' \
+            "$source_backup/" \
+            "$deploy_path/"
+          RESTORE_SCRIPT
+            exit 1
+          fi
+
+      - name: Build and activate site on server
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
@@ -106,25 +151,157 @@ jobs:
 
           SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
-          REMOTE_COMMAND="cd $(printf '%q' "$REMOTE_PATH") && hugo --gc --minify"
+          $SSH_CMD "$REMOTE" sh -s -- \
+            "$REMOTE_PATH" \
+            "$GITHUB_SHA" \
+            "$GITHUB_RUN_ID" \
+            "$GITHUB_RUN_ATTEMPT" <<'REMOTE_SCRIPT'
+          set -eu
 
-          $SSH_CMD "$REMOTE" "$REMOTE_COMMAND"
+          deploy_path="$1"
+          release_id="$2-$3-$4"
+          release_root="/www/wwwroot/blog-public-releases"
+          release_path="$release_root/$release_id"
+          next_link="$deploy_path/.public-next-$release_id"
+          current_path="$deploy_path/public"
+          rollback_marker="$release_root/.previous-$release_id"
+          source_backup="/www/wwwroot/blog-source-rollbacks/$release_id"
+          service_installed=0
 
-      - name: Restart blog admin service when installed
+          if systemctl list-unit-files blog-admin.service >/dev/null 2>&1; then
+            service_installed=1
+          fi
+          wait_for_admin() {
+            attempt=1
+            while [ "$attempt" -le 30 ]; do
+              if curl \
+                --fail \
+                --silent \
+                --show-error \
+                --max-time 2 \
+                http://127.0.0.1:18080/health >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 1
+              attempt=$((attempt + 1))
+            done
+            return 1
+          }
+          rollback_source_on_error() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              set +e
+              if [ -d "$source_backup" ]; then
+                rsync -a --delete \
+                  --exclude '.git' \
+                  --exclude '/public' \
+                  --exclude 'resources/_gen/' \
+                  "$source_backup/" \
+                  "$deploy_path/"
+              fi
+              if [ "$service_installed" -eq 1 ]; then
+                systemctl restart blog-admin.service
+                wait_for_admin
+              fi
+              set -e
+            fi
+            exit "$status"
+          }
+          trap rollback_source_on_error EXIT
+
+          umask 022
+          test -d "$source_backup"
+          mkdir -p "$release_root"
+          if [ -e "$release_path" ] || [ -L "$release_path" ]; then
+            echo "Release path already exists: $release_path" >&2
+            exit 1
+          fi
+          if [ -e "$next_link" ] || [ -L "$next_link" ]; then
+            echo "Temporary public link already exists: $next_link" >&2
+            exit 1
+          fi
+          if [ -e "$rollback_marker" ] || [ -L "$rollback_marker" ]; then
+            echo "Rollback marker already exists: $rollback_marker" >&2
+            exit 1
+          fi
+
+          hugo \
+            --source "$deploy_path" \
+            --gc \
+            --minify \
+            --destination "$release_path"
+
+          for required_asset in \
+            admin/index.html \
+            admin/version.json \
+            admin/styles.css \
+            admin/boot.js \
+            admin/admin.js \
+            admin/api.js \
+            admin/ui.js \
+            admin/pages/dashboard.js \
+            admin/pages/articles.js \
+            admin/pages/editor.js \
+            admin/pages/categories.js \
+            admin/pages/analytics.js; do
+            test -f "$release_path/$required_asset"
+          done
+
+          if [ "$service_installed" -eq 1 ]; then
+            systemctl restart blog-admin.service
+            systemctl is-active --quiet blog-admin.service
+            wait_for_admin
+          fi
+
+          ln -s "$release_path" "$next_link"
+          previous_target=""
+          if [ -e "$current_path" ] && [ ! -L "$current_path" ]; then
+            legacy_path="$release_root/legacy-$release_id"
+            if [ -e "$legacy_path" ] || [ -L "$legacy_path" ]; then
+              echo "Legacy public backup already exists: $legacy_path" >&2
+              exit 1
+            fi
+            previous_target="$legacy_path"
+          elif [ -L "$current_path" ]; then
+            previous_target="$(readlink -f "$current_path")"
+            test -d "$previous_target"
+          fi
+          printf '%s\n' "$previous_target" > "$rollback_marker"
+          chmod 600 "$rollback_marker"
+
+          if [ -n "${legacy_path:-}" ]; then
+            mv "$current_path" "$legacy_path"
+          fi
+          if ! mv -Tf "$next_link" "$current_path"; then
+            if [ -n "${legacy_path:-}" ] && [ ! -e "$current_path" ]; then
+              mv "$legacy_path" "$current_path"
+            fi
+            exit 1
+          fi
+          if \
+            [ ! -L "$current_path" ] \
+            || [ "$(readlink -f "$current_path")" != "$release_path" ]; then
+            if [ -n "$previous_target" ] && [ -d "$previous_target" ]; then
+              restore_link="$deploy_path/.public-activate-rollback-$release_id"
+              ln -s "$previous_target" "$restore_link"
+              mv -Tf "$restore_link" "$current_path"
+            fi
+            exit 1
+          fi
+          trap - EXIT
+          REMOTE_SCRIPT
+
+      - name: Verify production site
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
           set -euo pipefail
 
-          export SSHPASS="$DEPLOY_PASSWORD"
-          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
-          REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
-          $SSH_CMD "$REMOTE" "if systemctl list-unit-files blog-admin.service >/dev/null 2>&1; then systemctl restart blog-admin.service; fi"
-
-      - name: Verify production site
-        run: |
+          set +e
+          (
           set -euo pipefail
 
           curl --fail --head --max-time 20 https://shcxyz.site/
@@ -171,3 +348,154 @@ jobs:
           payload = json.load(sys.stdin)
           assert payload.get("authenticated") is False
           '
+
+          python3 - <<'PY'
+          from html.parser import HTMLParser
+          import re
+          import urllib.parse
+          import urllib.request
+
+          class ModuleEntryParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.entries = []
+
+              def handle_starttag(self, tag, attrs):
+                  attributes = dict(attrs)
+                  if (
+                      tag == "script"
+                      and attributes.get("type") == "module"
+                      and attributes.get("src")
+                  ):
+                      self.entries.append(attributes["src"])
+
+          index_url = "https://shcxyz.site/admin/"
+          with urllib.request.urlopen(index_url, timeout=20) as response:
+              parser = ModuleEntryParser()
+              parser.feed(response.read().decode("utf-8"))
+          assert len(parser.entries) == 1, parser.entries
+
+          seen = set()
+          pending = [urllib.parse.urljoin(index_url, parser.entries[0])]
+          import_pattern = re.compile(
+              r"""(?:from\s*|import\s*\()\s*["']([^"']+)["']"""
+          )
+
+          while pending:
+              url = pending.pop()
+              if url in seen:
+                  continue
+              seen.add(url)
+              parsed = urllib.parse.urlparse(url)
+              assert parsed.netloc == "shcxyz.site", url
+              assert parsed.path.startswith("/admin/"), url
+              with urllib.request.urlopen(url, timeout=20) as response:
+                  content_type = response.headers.get_content_type()
+                  assert response.status == 200, (url, response.status)
+                  assert content_type in {
+                      "application/javascript",
+                      "text/javascript",
+                  }, (url, content_type)
+                  source = response.read().decode("utf-8")
+              for specifier in import_pattern.findall(source):
+                  pending.append(urllib.parse.urljoin(url, specifier))
+
+          assert any(
+              urllib.parse.urlparse(url).path == "/admin/admin.js"
+              for url in seen
+          ), seen
+          PY
+
+          MISSING_MODULE_STATUS="$(
+            curl \
+              --silent \
+              --show-error \
+              --max-time 20 \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              https://shcxyz.site/admin/pages/__missing_module_probe__.js
+          )"
+          test "$MISSING_MODULE_STATUS" = "404"
+          )
+          verification_status=$?
+          set -e
+
+          if [[ "$verification_status" -eq 0 ]]; then
+            exit 0
+          fi
+
+          EXPECTED_REMOTE_PATH="/www/wwwroot/blog"
+          REMOTE_PATH="${DEPLOY_PATH:-$EXPECTED_REMOTE_PATH}"
+          if [[ "$REMOTE_PATH" != "$EXPECTED_REMOTE_PATH" ]]; then
+            echo "DEPLOY_PATH must remain $EXPECTED_REMOTE_PATH" >&2
+            exit 1
+          fi
+          : "${DEPLOY_HOST:?Missing DEPLOY_HOST secret}"
+          : "${DEPLOY_USER:?Missing DEPLOY_USER secret}"
+          : "${DEPLOY_PASSWORD:?Missing DEPLOY_PASSWORD secret}"
+
+          export SSHPASS="$DEPLOY_PASSWORD"
+          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
+          $SSH_CMD "$REMOTE" sh -s -- \
+            "$REMOTE_PATH" \
+            "$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" <<'ROLLBACK_SCRIPT'
+          set -eu
+
+          deploy_path="$1"
+          release_id="$2"
+          release_root="/www/wwwroot/blog-public-releases"
+          rollback_marker="$release_root/.previous-$release_id"
+          current_path="$deploy_path/public"
+          rollback_link="$deploy_path/.public-rollback-$release_id"
+          source_backup="/www/wwwroot/blog-source-rollbacks/$release_id"
+          wait_for_admin() {
+            attempt=1
+            while [ "$attempt" -le 30 ]; do
+              if curl \
+                --fail \
+                --silent \
+                --show-error \
+                --max-time 2 \
+                http://127.0.0.1:18080/health >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 1
+              attempt=$((attempt + 1))
+            done
+            return 1
+          }
+
+          test -f "$rollback_marker"
+          previous_target="$(sed -n '1p' "$rollback_marker")"
+          case "$previous_target" in
+            "$release_root"/*) ;;
+            *)
+              echo "Unsafe or missing public rollback target: $previous_target" >&2
+              exit 1
+              ;;
+          esac
+          test -d "$previous_target"
+          if [ -e "$rollback_link" ] || [ -L "$rollback_link" ]; then
+            echo "Rollback link already exists: $rollback_link" >&2
+            exit 1
+          fi
+          ln -s "$previous_target" "$rollback_link"
+          mv -Tf "$rollback_link" "$current_path"
+          test "$(readlink -f "$current_path")" = "$previous_target"
+          test -d "$source_backup"
+          rsync -a --delete \
+            --exclude '.git' \
+            --exclude '/public' \
+            --exclude 'resources/_gen/' \
+            "$source_backup/" \
+            "$deploy_path/"
+          if systemctl list-unit-files blog-admin.service >/dev/null 2>&1; then
+            systemctl restart blog-admin.service
+            systemctl is-active --quiet blog-admin.service
+            wait_for_admin
+          fi
+          ROLLBACK_SCRIPT
+
+          echo "Production verification failed; restored the previous public release." >&2
+          exit "$verification_status"

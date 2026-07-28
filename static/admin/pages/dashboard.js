@@ -9,7 +9,7 @@ import {
   renderTags,
   renderTrendChart,
   statusBadge,
-} from "../ui.js";
+} from "../ui.js?v=20260728-console-2";
 
 export async function renderDashboard(context) {
   const { api, container, signal } = context;
