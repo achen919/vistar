@@ -38,6 +38,7 @@ Required repository Secrets:
 | `DEPLOY_HOST` | Server IP or hostname |
 | `DEPLOY_USER` | SSH user, for example `root` |
 | `DEPLOY_PASSWORD` | SSH password |
+| `DEPLOY_HOST_KEY` | Verified `known_hosts` line for the production server |
 | `DEPLOY_PATH` | Optional, defaults to `/www/wwwroot/blog` |
 
 ## Server Management
@@ -52,18 +53,44 @@ export BLOG_SSH_PASSWORD='your-server-password'
 
 If `BLOG_SSH_PASSWORD` is not set, the script falls back to normal SSH authentication.
 
-## Private Web Editor
+## Blog management console
 
-The private editor lives at `/admin/` and is protected by Nginx Basic Auth. The API service listens only on `127.0.0.1:18080`; public traffic reaches it only through the protected Nginx `/admin/api/` location.
+The management console lives at `/admin/`. It uses an application login and a
+short-lived signed session cookie rather than browser-level HTTP Basic Auth.
+The API listens only on `127.0.0.1:18080` and also enforces its own
+authentication, CSRF token, same-origin checks, login throttling, and audit log.
 
-Editor flow:
+The console is split into task-focused routes:
 
-1. Open `https://shcxyz.site/admin/`.
-2. Write Markdown and use the live preview.
-3. Edit category names, descriptions, and ordering.
-4. Click publish.
+- `/admin/` - overview, recent posts, and traffic summary.
+- `/admin/articles/` - searchable article list with create, edit, draft, and delete actions.
+- `/admin/articles/new/` - focused Markdown authoring page.
+- `/admin/categories/` - category CRUD and persisted drag ordering.
+- `/admin/analytics/` - PV/UV trends, popular pages, and referring sites.
 
-The backend writes `content/posts/*.md`, updates the configured Hugo categories, builds the live Hugo site, commits to GitHub `main`, and pushes. The normal GitHub Actions deployment still runs after the push, so the repository remains the source of truth.
+Article editing and category editing are independent. Category responses and
+article details include versions, so a stale browser tab receives a conflict
+instead of silently overwriting newer work. Category names use a stable ID;
+renaming a category updates article references. A category that is still in use
+must be migrated before it can be deleted.
+
+The backend writes `content/posts/*.md` and category configuration in a
+dedicated checkout, validates a complete Hugo build, commits, and pushes to
+GitHub `main`. GitHub Actions remains the deployment path and the repository
+remains the source of truth. Failed validation is rolled back before anything
+is committed. If GitHub is temporarily unreachable after a local commit, the
+API returns `publish_pending` and blocks further content mutations so the same
+create, update, or delete is not accidentally repeated. Authenticated clients
+can inspect `GET /admin/api/publish/status` and retry only the push with
+`POST /admin/api/publish/retry` (the retry request requires the normal CSRF
+header).
+
+Traffic data is aggregated from the local Nginx access log. PV excludes admin,
+API, static-asset, failed, and known bot requests. UV is a keyed HMAC of IP and
+user agent; raw visitor identifiers are never returned or persisted by the
+admin service. Available history follows the server's access-log retention and
+the configured read limit. The public footer uses the same first-party summary
+endpoint and no longer runs third-party analytics JavaScript.
 
 Server setup files:
 
@@ -73,14 +100,74 @@ Server setup files:
 - `deploy/install-blog-admin.sh` - server installer.
 - `deploy/blog-admin.env.example` - environment template.
 
-Do not commit admin passwords or SSH private keys. The first installer run creates `/root/.ssh/vistar_blog_admin_ed25519` and prints the public key if GitHub has not authorized it yet. Add that public key to this repository as a writable deploy key, then rerun the installer:
+Do not commit admin passwords, SSH private keys, or unverified host keys. The
+installer creates a dedicated, non-login `blog-admin` system user, stores its
+deploy key under `/var/lib/blog-admin/.ssh/`, hashes the login password with
+PBKDF2-SHA256, and generates separate random session and analytics secrets.
+
+Before cloning over SSH, prepare a dedicated GitHub `known_hosts` file. One
+safe workflow is to collect a candidate key, print its fingerprint, compare it
+out-of-band with
+[GitHub's published SSH fingerprints](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints),
+and install the file only after it matches:
+
+```bash
+install -d -m 700 /root/.ssh
+ssh-keyscan -t ed25519 github.com > /root/.ssh/github-known-hosts.candidate
+ssh-keygen -lf /root/.ssh/github-known-hosts.candidate
+# Compare the displayed fingerprint with GitHub's official page first.
+install -m 600 \
+  /root/.ssh/github-known-hosts.candidate \
+  /root/.ssh/github-known-hosts
+```
+
+`ssh-keyscan` proves only what the current network returned; its output is not
+trusted until the fingerprint has been independently verified.
+
+On a new server, run the installer once without a password. It creates the
+deploy key, prints the public half, and deliberately exits with status `2`
+before cloning or changing the running service:
 
 ```bash
 cd /www/wwwroot/blog
-BLOG_ADMIN_USER='achen919' BLOG_ADMIN_PASSWORD='your-password' ./deploy/install-blog-admin.sh
+./deploy/install-blog-admin.sh
 ```
 
-The installer defaults `BLOG_ADMIN_UPDATE_SUBMODULES=0` and copies the already-deployed PaperMod theme into the admin source clone. This avoids blocking publish operations on GitHub submodule network access from the server.
+Add `/var/lib/blog-admin/.ssh/vistar_blog_admin_ed25519.pub` to this repository
+as a writable deploy key. Then rerun the installer with the verified host-key
+file and the admin credentials:
+
+```bash
+cd /www/wwwroot/blog
+BLOG_ADMIN_USER='admin' \
+BLOG_ADMIN_PASSWORD='use-a-long-unique-password' \
+BLOG_ADMIN_GITHUB_KNOWN_HOSTS_FILE='/root/.ssh/github-known-hosts' \
+./deploy/install-blog-admin.sh
+```
+
+An upgrade that already has an authorized deploy key can use the second command
+directly. The installer rejects symbolic links, broad system directories, and
+unexpected source, state, key, log, or deployment paths before changing
+ownership or permissions.
+
+The installer requires a pre-verified `known_hosts` entry for `github.com`; it
+does not trust an `ssh-keyscan` result automatically. By default it reads
+`/root/.ssh/known_hosts`, or you can point
+`BLOG_ADMIN_GITHUB_KNOWN_HOSTS_FILE` at another verified file. If the Nginx log
+group cannot be detected, set `BLOG_ADMIN_LOG_GROUP` explicitly (for example
+`www`, `www-data`, or `nginx`) and configure log rotation to recreate the access
+log with that readable group.
+
+For an upgrade from the old Basic Auth console:
+
+1. Run the installer to create `/etc/blog-admin.env` and the restricted service user.
+2. Replace the active site vhost with `deploy/nginx/shcxyz.site.conf`.
+3. Run `nginx -t`, reload Nginx, and verify login plus logout.
+4. Remove the old `.htpasswd-blog-admin` after verification.
+
+The installer deliberately does not overwrite a hosting panel's active Nginx
+vhost. It defaults `BLOG_ADMIN_UPDATE_SUBMODULES=0` and copies the already
+deployed PaperMod theme into the management checkout when needed.
 
 ## SSL
 
