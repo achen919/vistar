@@ -80,7 +80,10 @@ grep -Fq 'SOURCE_BACKUP="/www/wwwroot/blog-source-rollbacks/$RELEASE_ID"' .githu
 grep -Fq 'rollback_source_on_error()' .github/workflows/deploy.yml
 grep -Fq "Install admin Python dependencies" .github/workflows/deploy.yml
 grep -Fq -- "--requirement requirements-admin.txt" .github/workflows/deploy.yml
+grep -Fq "Admin cacheable assets changed without an asset version bump" .github/workflows/deploy.yml
 grep -Fq "require_admin_python_dependencies()" .github/workflows/deploy.yml
+grep -Fq "migrate_admin_stats_cache_ttl()" .github/workflows/deploy.yml
+grep -Fq "BLOG_ADMIN_STATS_CACHE_SECONDS=300" .github/workflows/deploy.yml
 grep -Fq 'nginx_config="/www/server/panel/vhost/nginx/blog.conf"' .github/workflows/deploy.yml
 grep -Fq 'nginx_backup="${nginx_config}.rollback-${release_id}.bak"' .github/workflows/deploy.yml
 grep -Fq 'Refusing non-regular or symbolic-link Nginx config' .github/workflows/deploy.yml
@@ -115,6 +118,10 @@ nginx = Path("deploy/nginx/shcxyz.site.conf").read_text(encoding="utf-8")
 dotfile_deny = "location ~ /\\.(?!well-known)"
 admin_assets = "location ~* ^/admin/.*\\."
 assert nginx.index(dotfile_deny) < nginx.index(admin_assets)
+assert (
+    'add_header Cache-Control "public, max-age=31536000, immutable";'
+    in nginx[nginx.index(admin_assets):nginx.index("    location /admin/ {")]
+)
 api_location = """    location ^~ /admin/api/ {
         access_log off;
         client_max_body_size 8m;

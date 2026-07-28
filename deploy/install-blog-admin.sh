@@ -374,7 +374,7 @@ trap cleanup_env_temp EXIT
   printf 'BLOG_ADMIN_SSH_KEY=%s\n' "${BLOG_ADMIN_SSH_KEY}"
   printf 'BLOG_ADMIN_UPDATE_SUBMODULES=%s\n' "${BLOG_ADMIN_UPDATE_SUBMODULES}"
   printf 'BLOG_ADMIN_ACCESS_LOG=%s\n' "${BLOG_ADMIN_ACCESS_LOG}"
-  printf 'BLOG_ADMIN_STATS_CACHE_SECONDS=60\n'
+  printf 'BLOG_ADMIN_STATS_CACHE_SECONDS=300\n'
   printf 'BLOG_ADMIN_TIMEZONE=Asia/Shanghai\n'
   printf 'BLOG_ADMIN_AUDIT_LOG=%s/audit.log\n' "${BLOG_ADMIN_STATE_DIR}"
   printf 'BLOG_ADMIN_REVOCATION_FILE=%s/revoked-sessions.jsonl\n' "${BLOG_ADMIN_STATE_DIR}"

@@ -419,7 +419,7 @@ def ensure_source_repo(*, force: bool = False) -> Path:
                 public_message="无法切换内容分支。",
             )
             run(
-                ["git", "pull", "--ff-only", "origin", branch],
+                ["git", "merge", "--ff-only", f"origin/{branch}"],
                 target,
                 proc_env=proc_env,
                 public_message="远端内容存在冲突，请在服务器处理后重试。",
@@ -463,16 +463,18 @@ def ensure_source_repo(*, force: bool = False) -> Path:
 
 def root_for_read() -> Path:
     target = source_dir()
-    if os.environ.get("BLOG_ADMIN_SOURCE_DIR") and (target / ".git").exists():
+    if (target / "hugo.toml").exists():
+        return target
+    if os.environ.get("BLOG_ADMIN_SOURCE_DIR"):
         try:
             return ensure_source_repo()
         except BlogAdminError:
             if (target / "hugo.toml").exists():
-                logger.exception("read-side source sync failed; serving the last local snapshot")
+                logger.exception(
+                    "source initialization failed; serving the available local snapshot"
+                )
                 return target
             raise
-    if (target / "hugo.toml").exists():
-        return target
     return REPO_ROOT
 
 
@@ -1551,10 +1553,13 @@ def update_categories(payload: dict[str, Any]) -> dict[str, Any]:
 def publish(payload: dict[str, Any]) -> dict[str, Any]:
     """Backward-compatible helper that no longer rewrites the category catalog."""
     if bool(payload.get("overwrite", False)):
-        root = root_for_read()
-        slug = validate_slug(str(payload.get("slug", "")))
-        current = get_post(root, slug)
-        return update_post(slug, {**payload, "version": current["version"]})
+        with publish_lock:
+            root = root_for_read()
+            slug = validate_slug(str(payload.get("slug", "")))
+            current = get_post(root, slug)
+            return update_post(
+                slug, {**payload, "version": current["version"]}
+            )
     return create_post(payload)
 
 
@@ -2526,47 +2531,119 @@ def _parse_access_log_uncached(path: Path) -> dict[str, Any]:
     return result
 
 
-def parse_access_log(path: Path) -> dict[str, Any]:
+def stats_cache_ttl_seconds() -> int:
+    try:
+        ttl = int(env("BLOG_ADMIN_STATS_CACHE_SECONDS", "300"))
+    except ValueError:
+        ttl = 300
+    return max(5, min(ttl, 300))
+
+
+def _refresh_stats_cache(path: Path) -> dict[str, Any]:
     global _stats_cache_key, _stats_cache_value, _stats_cache_expires_at
 
     path_key = str(path)
+    result = _parse_access_log_uncached(path)
+    try:
+        stat = path.stat()
+        cache_key = (path_key, stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        cache_key = (path_key, 0, 0)
+    with stats_lock:
+        _stats_cache_key = cache_key
+        _stats_cache_value = result
+        _stats_cache_expires_at = (
+            time.monotonic() + stats_cache_ttl_seconds()
+        )
+    return result
+
+
+def _refresh_stats_cache_in_background(path: Path) -> None:
+    global _stats_cache_expires_at
+
+    try:
+        _refresh_stats_cache(path)
+    except Exception:
+        logger.exception("unable to refresh analytics cache in background")
+        with stats_lock:
+            _stats_cache_expires_at = max(
+                _stats_cache_expires_at, time.monotonic() + 5
+            )
+    finally:
+        stats_refresh_lock.release()
+
+
+def _start_stats_cache_refresh(path: Path) -> None:
+    try:
+        thread = threading.Thread(
+            target=_refresh_stats_cache_in_background,
+            args=(path,),
+            name="blog-admin-stats-refresh",
+            daemon=True,
+        )
+        thread.start()
+    except Exception:
+        stats_refresh_lock.release()
+        logger.exception("unable to start analytics cache refresh")
+
+
+def parse_access_log(path: Path) -> dict[str, Any]:
+    path_key = str(path)
     now = time.monotonic()
     with stats_lock:
-        if (
+        cache_matches = (
             _stats_cache_key is not None
             and _stats_cache_key[0] == path_key
             and _stats_cache_value is not None
-            and now < _stats_cache_expires_at
-        ):
+        )
+        if cache_matches and now < _stats_cache_expires_at:
             return _stats_cache_value
+        stale = _stats_cache_value if cache_matches else None
+
+    if stale is not None:
+        if stats_refresh_lock.acquire(blocking=False):
+            now = time.monotonic()
+            with stats_lock:
+                if (
+                    _stats_cache_key is not None
+                    and _stats_cache_key[0] == path_key
+                    and _stats_cache_value is not None
+                    and now < _stats_cache_expires_at
+                ):
+                    stats_refresh_lock.release()
+                    return _stats_cache_value
+            _start_stats_cache_refresh(path)
+        return stale
 
     with stats_refresh_lock:
-        now = time.monotonic()
         with stats_lock:
             if (
                 _stats_cache_key is not None
                 and _stats_cache_key[0] == path_key
                 and _stats_cache_value is not None
-                and now < _stats_cache_expires_at
             ):
                 return _stats_cache_value
+        return _refresh_stats_cache(path)
 
-        result = _parse_access_log_uncached(path)
+
+def start_stats_cache_warmup() -> threading.Thread | None:
+    def warm() -> None:
         try:
-            stat = path.stat()
-            cache_key = (path_key, stat.st_mtime_ns, stat.st_size)
-        except OSError:
-            cache_key = (path_key, 0, 0)
-        try:
-            ttl = int(env("BLOG_ADMIN_STATS_CACHE_SECONDS", "60"))
-        except ValueError:
-            ttl = 60
-        ttl = max(5, min(ttl, 300))
-        with stats_lock:
-            _stats_cache_key = cache_key
-            _stats_cache_value = result
-            _stats_cache_expires_at = time.monotonic() + ttl
-        return result
+            parse_access_log(analytics_log_path())
+        except Exception:
+            logger.exception("unable to warm analytics cache")
+
+    try:
+        thread = threading.Thread(
+            target=warm,
+            name="blog-admin-stats-warmup",
+            daemon=True,
+        )
+        thread.start()
+        return thread
+    except Exception:
+        logger.exception("unable to start analytics cache warmup")
+        return None
 
 
 def site_stats(days: int = 30) -> dict[str, Any]:
@@ -2993,9 +3070,9 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
         if method == "GET" and path == "/api/publish/status":
-            self.send_json(
-                HTTPStatus.OK, pending_publish_status(root_for_read())
-            )
+            with publish_lock:
+                payload = pending_publish_status(root_for_read())
+            self.send_json(HTTPStatus.OK, payload)
             return
         if method == "POST" and path == "/api/publish/retry":
             payload = retry_pending_publish()
@@ -3008,7 +3085,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.OK, payload)
             return
         if method == "GET" and path == "/api/overview":
-            self.send_json(HTTPStatus.OK, overview_payload(root_for_read()))
+            with publish_lock:
+                payload = overview_payload(root_for_read())
+            self.send_json(HTTPStatus.OK, payload)
             return
         if method == "POST" and path == "/api/uploads/images":
             filename, mime_type, content = self.read_multipart_image()
@@ -3086,13 +3165,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.OK, payload)
             return
         if method == "GET" and path == "/api/posts":
-            self.send_json(
-                HTTPStatus.OK, {"posts": list_posts(root_for_read())}
-            )
+            with publish_lock:
+                payload = {"posts": list_posts(root_for_read())}
+            self.send_json(HTTPStatus.OK, payload)
             return
         slug = self.post_slug_from_path(path)
         if method == "GET" and slug:
-            self.send_json(HTTPStatus.OK, get_post(root_for_read(), slug))
+            with publish_lock:
+                payload = get_post(root_for_read(), slug)
+            self.send_json(HTTPStatus.OK, payload)
             return
         if method == "POST" and path == "/api/posts":
             payload = create_post(self.read_json())
@@ -3135,7 +3216,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.OK, payload)
             return
         if method == "GET" and path == "/api/categories":
-            self.send_json(HTTPStatus.OK, categories_payload(root_for_read()))
+            with publish_lock:
+                payload = categories_payload(root_for_read())
+            self.send_json(HTTPStatus.OK, payload)
             return
         if method == "PUT" and path == "/api/categories":
             payload = update_categories(self.read_json())
@@ -3233,6 +3316,7 @@ def main() -> None:
         raise SystemExit("BLOG_ADMIN_HOST must remain loopback-only")
     port = int(env("BLOG_ADMIN_PORT", "18080"))
     server = BlogAdminHTTPServer((host, port), Handler)
+    start_stats_cache_warmup()
     logger.info("Blog admin API listening on %s:%s", host, port)
     server.serve_forever()
 
