@@ -8,7 +8,7 @@ on:
 
 concurrency:
   group: deploy-blog-production
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -56,13 +56,26 @@ jobs:
           : "${DEPLOY_USER:?Missing DEPLOY_USER secret}"
           : "${DEPLOY_PASSWORD:?Missing DEPLOY_PASSWORD secret}"
 
-          REMOTE_PATH="${DEPLOY_PATH:-/www/wwwroot/blog}"
+          EXPECTED_REMOTE_PATH="/www/wwwroot/blog"
+          REMOTE_PATH="${DEPLOY_PATH:-$EXPECTED_REMOTE_PATH}"
+          if [[ "$REMOTE_PATH" != "$EXPECTED_REMOTE_PATH" ]]; then
+            echo "DEPLOY_PATH must remain $EXPECTED_REMOTE_PATH" >&2
+            exit 1
+          fi
           export SSHPASS="$DEPLOY_PASSWORD"
 
           SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
 
-          $SSH_CMD "$REMOTE" "mkdir -p $(printf '%q' "$REMOTE_PATH")"
+          $SSH_CMD "$REMOTE" "
+            set -eu
+            if [ -L '$REMOTE_PATH' ]; then
+              echo 'Refusing symbolic-link deployment path: $REMOTE_PATH' >&2
+              exit 1
+            fi
+            mkdir -p '$REMOTE_PATH'
+            test -d '$REMOTE_PATH'
+          "
 
           rsync -az --delete \
             --exclude '.git/' \
@@ -83,7 +96,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          REMOTE_PATH="${DEPLOY_PATH:-/www/wwwroot/blog}"
+          EXPECTED_REMOTE_PATH="/www/wwwroot/blog"
+          REMOTE_PATH="${DEPLOY_PATH:-$EXPECTED_REMOTE_PATH}"
+          if [[ "$REMOTE_PATH" != "$EXPECTED_REMOTE_PATH" ]]; then
+            echo "DEPLOY_PATH must remain $EXPECTED_REMOTE_PATH" >&2
+            exit 1
+          fi
           export SSHPASS="$DEPLOY_PASSWORD"
 
           SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
@@ -107,4 +125,49 @@ jobs:
 
       - name: Verify production site
         run: |
+          set -euo pipefail
+
           curl --fail --head --max-time 20 https://shcxyz.site/
+
+          ADMIN_HEADERS="$RUNNER_TEMP/admin-headers.txt"
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --max-time 20 \
+            --dump-header "$ADMIN_HEADERS" \
+            --output /dev/null \
+            https://shcxyz.site/admin/
+          if grep -Eiq '^www-authenticate:' "$ADMIN_HEADERS"; then
+            echo "Legacy HTTP Basic Auth is still active on /admin/." >&2
+            exit 1
+          fi
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --max-time 20 \
+            https://shcxyz.site/analytics/summary |
+            python3 -c '
+          import json
+          import sys
+
+          payload = json.load(sys.stdin)
+          assert set(payload) == {"pv", "uv"}
+          assert all(isinstance(payload[key], int) for key in ("pv", "uv"))
+          '
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --max-time 20 \
+            https://shcxyz.site/admin/api/session |
+            python3 -c '
+          import json
+          import sys
+
+          payload = json.load(sys.stdin)
+          assert payload.get("authenticated") is False
+          '

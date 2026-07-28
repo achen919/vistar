@@ -135,14 +135,18 @@ cd /www/wwwroot/blog
 
 Add `/var/lib/blog-admin/.ssh/vistar_blog_admin_ed25519.pub` to this repository
 as a writable deploy key. Then rerun the installer with the verified host-key
-file and the admin credentials:
+file and an interactively entered admin password, so the password is not saved
+in shell history:
 
 ```bash
 cd /www/wwwroot/blog
+read -rsp 'Blog admin password: ' BLOG_ADMIN_PASSWORD
+printf '\n'
+export BLOG_ADMIN_PASSWORD
 BLOG_ADMIN_USER='admin' \
-BLOG_ADMIN_PASSWORD='use-a-long-unique-password' \
-BLOG_ADMIN_GITHUB_KNOWN_HOSTS_FILE='/root/.ssh/github-known-hosts' \
-./deploy/install-blog-admin.sh
+  BLOG_ADMIN_GITHUB_KNOWN_HOSTS_FILE='/root/.ssh/github-known-hosts' \
+  ./deploy/install-blog-admin.sh
+unset BLOG_ADMIN_PASSWORD
 ```
 
 An upgrade that already has an authorized deploy key can use the second command
