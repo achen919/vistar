@@ -19,9 +19,9 @@ if [[ -n "${BLOG_SSH_PASSWORD:-}" ]]; then
   fi
 
   if sshpass -h 2>&1 | grep -q -- '-e\[env_var\]'; then
-    SSHPASS="$BLOG_SSH_PASSWORD" sshpass -eSSHPASS ssh -o StrictHostKeyChecking=no "$BLOG_SERVER" "$remote_command"
+    SSHPASS="$BLOG_SSH_PASSWORD" sshpass -eSSHPASS ssh -o StrictHostKeyChecking=yes "$BLOG_SERVER" "$remote_command"
   else
-    SSHPASS="$BLOG_SSH_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=no "$BLOG_SERVER" "$remote_command"
+    SSHPASS="$BLOG_SSH_PASSWORD" sshpass -e ssh -o StrictHostKeyChecking=yes "$BLOG_SERVER" "$remote_command"
   fi
 else
   ssh "$BLOG_SERVER" "$remote_command"

@@ -28,6 +28,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rsync sshpass
 
+      - name: Configure SSH host verification
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_HOST_KEY: ${{ secrets.DEPLOY_HOST_KEY }}
+        run: |
+          set -euo pipefail
+
+          : "${DEPLOY_HOST:?Missing DEPLOY_HOST secret}"
+          : "${DEPLOY_HOST_KEY:?Missing DEPLOY_HOST_KEY secret}"
+
+          install -d -m 700 "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_HOST_KEY" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          ssh-keygen -F "$DEPLOY_HOST" -f "$HOME/.ssh/known_hosts" >/dev/null
+
       - name: Sync source to server
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
@@ -44,7 +59,7 @@ jobs:
           REMOTE_PATH="${DEPLOY_PATH:-/www/wwwroot/blog}"
           export SSHPASS="$DEPLOY_PASSWORD"
 
-          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=no"
+          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
 
           $SSH_CMD "$REMOTE" "mkdir -p $(printf '%q' "$REMOTE_PATH")"
@@ -71,7 +86,7 @@ jobs:
           REMOTE_PATH="${DEPLOY_PATH:-/www/wwwroot/blog}"
           export SSHPASS="$DEPLOY_PASSWORD"
 
-          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=no"
+          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
           REMOTE_COMMAND="cd $(printf '%q' "$REMOTE_PATH") && hugo --gc --minify"
 
@@ -86,7 +101,7 @@ jobs:
           set -euo pipefail
 
           export SSHPASS="$DEPLOY_PASSWORD"
-          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=no"
+          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
           REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
           $SSH_CMD "$REMOTE" "if systemctl list-unit-files blog-admin.service >/dev/null 2>&1; then systemctl restart blog-admin.service; fi"
 

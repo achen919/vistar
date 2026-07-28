@@ -3,77 +3,35 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>博客编辑器 | 阿辰的博客</title>
+    <meta name="robots" content="noindex, nofollow, noarchive" />
+    <meta name="color-scheme" content="light" />
+    <title>博客管理后台 | 阿辰的博客</title>
+    <link rel="icon" href="data:," />
     <link rel="stylesheet" href="/admin/styles.css" />
   </head>
   <body>
-    <header class="topbar">
-      <div>
-        <p class="eyebrow">阿辰的博客</p>
-        <h1>Markdown 编辑器</h1>
+    <div id="app" class="app-root" aria-live="polite">
+      <div class="boot-screen">
+        <div class="brand-mark" aria-hidden="true">辰</div>
+        <p>正在验证管理会话…</p>
       </div>
-      <div class="actions">
-        <button id="refreshCategories" type="button" class="secondary">刷新分类</button>
-        <button id="publishPost" type="button">一键发布</button>
-      </div>
-    </header>
+    </div>
 
-    <main class="workspace">
-      <section class="panel meta-panel" aria-label="文章信息">
-        <div class="field-grid">
-          <label>
-            <span>标题</span>
-            <input id="title" type="text" placeholder="文章标题" autocomplete="off" />
-          </label>
-          <label>
-            <span>文件名 / Slug</span>
-            <input id="slug" type="text" placeholder="backend-cache-design" autocomplete="off" />
-          </label>
-          <label>
-            <span>日期</span>
-            <input id="date" type="date" />
-          </label>
-          <label>
-            <span>标签</span>
-            <input id="tags" type="text" placeholder="Go, LLM, 缓存" autocomplete="off" />
-          </label>
+    <dialog id="globalConfirmDialog" class="dialog dialog-sm" aria-labelledby="confirmDialogTitle">
+      <form method="dialog" class="dialog-card">
+        <div class="dialog-icon" data-dialog-icon aria-hidden="true">!</div>
+        <div class="dialog-copy">
+          <h2 id="confirmDialogTitle">确认操作</h2>
+          <p data-dialog-message></p>
         </div>
-        <label class="check-row">
-          <input id="overwrite" type="checkbox" />
-          <span>覆盖同 slug 的已有文章</span>
-        </label>
-      </section>
+        <div class="dialog-actions">
+          <button type="submit" value="cancel" class="button button-secondary">取消</button>
+          <button type="submit" value="confirm" class="button button-danger" data-dialog-confirm>确认</button>
+        </div>
+      </form>
+    </dialog>
 
-      <section class="panel category-panel" aria-label="类别主题">
-        <div class="section-head">
-          <div>
-            <h2>类别主题</h2>
-            <p>拖动行暂未开放；用上下按钮调整展示顺序。</p>
-          </div>
-          <button id="addCategory" type="button" class="secondary">新增类别</button>
-        </div>
-        <div id="categoryList" class="category-list"></div>
-      </section>
-
-      <section class="editor-grid">
-        <div class="panel editor-panel">
-          <div class="section-head compact">
-            <h2>Markdown</h2>
-            <span id="wordCount">0 字</span>
-          </div>
-          <textarea id="content" spellcheck="false" placeholder="在这里写正文..."></textarea>
-        </div>
-        <div class="panel preview-panel">
-          <div class="section-head compact">
-            <h2>预览</h2>
-            <span>实时</span>
-          </div>
-          <article id="preview" class="preview"></article>
-        </div>
-      </section>
-    </main>
-
-    <div id="status" class="status" role="status" aria-live="polite"></div>
-    <script src="/admin/admin.js"></script>
+    <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+    <script type="module" src="/admin/admin.js"></script>
   </body>
 </html>

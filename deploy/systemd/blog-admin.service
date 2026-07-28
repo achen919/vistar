@@ -5,13 +5,30 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=blog-admin
+Group=blog-admin
 WorkingDirectory=/www/wwwroot/blog
 EnvironmentFile=/etc/blog-admin.env
 ExecStart=/usr/bin/python3 /www/wwwroot/blog/tools/blog_admin_server.py
 Restart=always
 RestartSec=3
+UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=true
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
 WantedBy=multi-user.target
