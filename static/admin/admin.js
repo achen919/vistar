@@ -3,10 +3,11 @@ import {
   ApiError,
   clearCsrfToken,
   setUnauthorizedHandler,
-} from "./api.js?v=20260728-console-3";
-import { escapeHtml, icon } from "./ui.js?v=20260728-console-3";
+} from "./api.js?v=20260728-console-4";
+import { escapeHtml, icon } from "./ui.js?v=20260728-console-4";
 
-const ASSET_VERSION = "20260728-console-3";
+const ASSET_VERSION = "20260728-console-4";
+const ASSET_VERSION_TIMEOUT_MS = 10_000;
 const app = document.querySelector("#app");
 const confirmDialog = document.querySelector("#globalConfirmDialog");
 const toastRegion = document.querySelector("#toastRegion");
@@ -17,7 +18,7 @@ const routes = [
     section: "dashboard",
     title: "仪表盘",
     description: "博客运营概览",
-    load: () => import("./pages/dashboard.js?v=20260728-console-3")
+    load: () => import("./pages/dashboard.js?v=20260728-console-4")
       .then((module) => module.renderDashboard),
   },
   {
@@ -25,7 +26,7 @@ const routes = [
     section: "articles",
     title: "文章管理",
     description: "管理全部内容与发布状态",
-    load: () => import("./pages/articles.js?v=20260728-console-3")
+    load: () => import("./pages/articles.js?v=20260728-console-4")
       .then((module) => module.renderArticles),
   },
   {
@@ -33,7 +34,7 @@ const routes = [
     section: "articles",
     title: "新建文章",
     description: "撰写并发布新的博客内容",
-    load: () => import("./pages/editor.js?v=20260728-console-3")
+    load: () => import("./pages/editor.js?v=20260728-console-4")
       .then((module) => module.renderEditor),
   },
   {
@@ -41,7 +42,7 @@ const routes = [
     section: "articles",
     title: "编辑文章",
     description: "修改文章内容与发布状态",
-    load: () => import("./pages/editor.js?v=20260728-console-3")
+    load: () => import("./pages/editor.js?v=20260728-console-4")
       .then((module) => module.renderEditor),
   },
   {
@@ -49,7 +50,7 @@ const routes = [
     section: "categories",
     title: "分类管理",
     description: "维护分类并调整前台展示顺序",
-    load: () => import("./pages/categories.js?v=20260728-console-3")
+    load: () => import("./pages/categories.js?v=20260728-console-4")
       .then((module) => module.renderCategories),
   },
   {
@@ -57,7 +58,7 @@ const routes = [
     section: "todos",
     title: "每日 Todo",
     description: "规划今日事项并回顾每日完成情况",
-    load: () => import("./pages/todos.js?v=20260728-console-3")
+    load: () => import("./pages/todos.js?v=20260728-console-4")
       .then((module) => module.renderTodos),
   },
   {
@@ -65,7 +66,7 @@ const routes = [
     section: "analytics",
     title: "数据统计",
     description: "查看网站访问与内容表现",
-    load: () => import("./pages/analytics.js?v=20260728-console-3")
+    load: () => import("./pages/analytics.js?v=20260728-console-4")
       .then((module) => module.renderAnalytics),
   },
 ];
@@ -75,6 +76,8 @@ let pageController = null;
 let pageCleanup = null;
 let leaveGuard = null;
 let currentLocation = `${window.location.pathname}${window.location.search}`;
+let assetVersionCheckPromise = null;
+const routeModuleCache = new Map();
 
 function markBootComplete() {
   if (window.__blogAdminBoot) window.__blogAdminBoot.complete();
@@ -275,16 +278,42 @@ function routeFor(pathname) {
   return routes.find((route) => route.match.test(pathname));
 }
 
-async function ensureCurrentAssetVersion(signal) {
-  const response = await fetch(
-    `/admin/version.json?expected=${encodeURIComponent(ASSET_VERSION)}`,
-    {
-      cache: "no-store",
-      credentials: "same-origin",
-      headers: { Accept: "application/json" },
-      signal,
-    },
+function loadRoute(route) {
+  if (!routeModuleCache.has(route)) {
+    const promise = route.load().catch((error) => {
+      routeModuleCache.delete(route);
+      throw error;
+    });
+    routeModuleCache.set(route, promise);
+  }
+  return routeModuleCache.get(route);
+}
+
+async function checkCurrentAssetVersion() {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(
+    () => controller.abort(),
+    ASSET_VERSION_TIMEOUT_MS,
   );
+  let response;
+  try {
+    response = await fetch(
+      `/admin/version.json?expected=${encodeURIComponent(ASSET_VERSION)}`,
+      {
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { Accept: "application/json" },
+        signal: controller.signal,
+      },
+    );
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new ApiError("管理后台版本校验超时，请重新加载页面。");
+    }
+    throw new ApiError("无法确认管理后台版本，请重新加载页面。");
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
   const contentType = response.headers.get("Content-Type") || "";
   if (!response.ok || !contentType.includes("application/json")) {
     throw new ApiError("无法确认管理后台版本，请重新加载页面。", response.status);
@@ -297,6 +326,28 @@ async function ensureCurrentAssetVersion(signal) {
   return true;
 }
 
+function ensureCurrentAssetVersion() {
+  if (!assetVersionCheckPromise) {
+    assetVersionCheckPromise = checkCurrentAssetVersion()
+      .finally(() => {
+        assetVersionCheckPromise = null;
+      });
+  }
+  return assetVersionCheckPromise;
+}
+
+function prepareRoute(route) {
+  if (!route) return null;
+  const versionPromise = ensureCurrentAssetVersion();
+  const renderPromise = loadRoute(route);
+  // Preloading starts before session validation. Attach handlers immediately so
+  // a static resource failure cannot become an unhandled rejection while the
+  // session request is still in flight.
+  versionPromise.catch(() => {});
+  renderPromise.catch(() => {});
+  return { route, versionPromise, renderPromise };
+}
+
 function updateNavigation(route) {
   const section = route?.section || "";
   app.querySelectorAll("[data-nav]").forEach((link) => {
@@ -307,7 +358,7 @@ function updateNavigation(route) {
   });
 }
 
-async function renderRoute() {
+async function renderRoute(preparedRoute = null) {
   const route = routeFor(window.location.pathname);
   const content = app.querySelector("#pageContent");
   if (!content) return;
@@ -362,9 +413,14 @@ async function renderRoute() {
   };
 
   try {
-    if (!(await ensureCurrentAssetVersion(controller.signal))) return;
-    if (controller.signal.aborted || pageController !== controller) return;
-    const render = await route.load();
+    const prepared = preparedRoute?.route === route
+      ? preparedRoute
+      : prepareRoute(route);
+    const [versionCurrent, render] = await Promise.all([
+      prepared.versionPromise,
+      prepared.renderPromise,
+    ]);
+    if (!versionCurrent) return;
     if (controller.signal.aborted || pageController !== controller) return;
     const cleanup = await render(context);
     if (controller.signal.aborted || pageController !== controller) {
@@ -469,16 +525,20 @@ window.addEventListener("beforeunload", (event) => {
 async function bootstrap() {
   const controller = new AbortController();
   const timeoutId = window.setTimeout(() => controller.abort(), 8000);
+  const preparedRoute = prepareRoute(routeFor(window.location.pathname));
   try {
     const payload = await api.session(controller.signal);
+    window.clearTimeout(timeoutId);
     if (!authenticated(payload)) {
+      controller.abort();
       renderLogin();
       return;
     }
     sessionInfo = payload;
     renderShell();
-    await renderRoute();
+    await renderRoute(preparedRoute);
   } catch (error) {
+    controller.abort();
     if (error.name === "AbortError") {
       renderLogin("会话验证超时，请检查网络后重试。");
     } else if (error.status === 401) renderLogin();

@@ -7,7 +7,7 @@ import {
   loadingState,
   today,
   unwrap,
-} from "../ui.js?v=20260728-console-3";
+} from "../ui.js?v=20260728-console-4";
 
 const DATE_FORMATTER = new Intl.DateTimeFormat("zh-CN", {
   month: "long",

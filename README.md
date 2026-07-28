@@ -90,7 +90,10 @@ API returns `publish_pending` and blocks further content mutations so the same
 create, update, or delete is not accidentally repeated. Authenticated clients
 can inspect `GET /admin/api/publish/status` and retry only the push with
 `POST /admin/api/publish/retry` (the retry request requires the normal CSRF
-header).
+header). Read requests use the current local checkout without running Git
+network commands. Before every content mutation, the service fetches once and
+fast-forwards that checkout, so remote changes are incorporated before any
+admin write.
 
 Article images are uploaded through the authenticated admin API. PNG, JPEG, GIF,
 and WebP files are fully decoded with Pillow, bounded by dimensions, pixel
@@ -105,8 +108,10 @@ Traffic data is aggregated from the local Nginx access log. PV excludes admin,
 API, static-asset, failed, and known bot requests. UV is a keyed HMAC of IP and
 user agent; raw visitor identifiers are never returned or persisted by the
 admin service. Available history follows the server's access-log retention and
-the configured read limit. The public footer uses the same first-party summary
-endpoint and no longer runs third-party analytics JavaScript.
+the configured read limit. Aggregates use a five-minute in-memory cache by
+default; an expired value is served while one background refresh rebuilds it.
+The public footer uses the same first-party summary endpoint and no longer runs
+third-party analytics JavaScript.
 
 Server setup files:
 

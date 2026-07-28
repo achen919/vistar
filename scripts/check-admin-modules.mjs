@@ -4,12 +4,34 @@ import vm from "node:vm";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const adminRoot = path.resolve("static/admin");
-const assetVersion = "20260728-console-3";
+const assetVersion = "20260728-console-4";
+const indexSource = await fs.readFile(
+  path.join(adminRoot, "index.html"),
+  "utf8",
+);
 const versionPayload = JSON.parse(
   await fs.readFile(path.join(adminRoot, "version.json"), "utf8"),
 );
 if (versionPayload.version !== assetVersion) {
   throw new Error("static/admin/version.json does not match the module version.");
+}
+const adminEntrySource = await fs.readFile(
+  path.join(adminRoot, "admin.js"),
+  "utf8",
+);
+if (!adminEntrySource.includes(`const ASSET_VERSION = "${assetVersion}";`)) {
+  throw new Error("static/admin/admin.js does not match the module version.");
+}
+for (const asset of [
+  "styles.css",
+  "boot.js",
+  "admin.js",
+  "api.js",
+  "ui.js",
+]) {
+  if (!indexSource.includes(`/admin/${asset}?v=${assetVersion}`)) {
+    throw new Error(`static/admin/index.html has a stale ${asset} version.`);
+  }
 }
 const entrySpecifiers = [
   "admin.js",

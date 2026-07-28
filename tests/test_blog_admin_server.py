@@ -3,6 +3,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -420,6 +421,71 @@ class PasswordAndSessionTests(unittest.TestCase):
                 self.assertIsNone(admin.decode_session(token))
 
 
+class ReadSourceTests(unittest.TestCase):
+    def test_existing_local_snapshot_never_triggers_git_sync(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "source"
+            root.mkdir()
+            (root / ".git").mkdir()
+            (root / "hugo.toml").write_text("title = 'snapshot'\n", encoding="utf-8")
+            with (
+                patch.dict(os.environ, {"BLOG_ADMIN_SOURCE_DIR": str(root)}),
+                patch.object(admin, "ensure_source_repo") as ensure_source,
+            ):
+                selected = admin.root_for_read()
+
+        self.assertEqual(selected, root.resolve())
+        ensure_source.assert_not_called()
+
+    def test_missing_local_snapshot_can_still_be_initialized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "source"
+            with (
+                patch.dict(os.environ, {"BLOG_ADMIN_SOURCE_DIR": str(root)}),
+                patch.object(
+                    admin, "ensure_source_repo", return_value=root.resolve()
+                ) as ensure_source,
+            ):
+                selected = admin.root_for_read()
+
+        self.assertEqual(selected, root.resolve())
+        ensure_source.assert_called_once_with()
+
+    def test_forced_source_sync_fetches_once_then_fast_forwards_local_branch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "source"
+            root.mkdir()
+            (root / ".git").mkdir()
+            (root / "hugo.toml").write_text("title = 'snapshot'\n", encoding="utf-8")
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "BLOG_ADMIN_SOURCE_DIR": str(root),
+                        "BLOG_ADMIN_BRANCH": "main",
+                        "BLOG_ADMIN_UPDATE_SUBMODULES": "0",
+                    },
+                ),
+                patch.object(admin, "ensure_content_clean") as ensure_clean,
+                patch.object(admin, "run") as run,
+                patch.object(admin, "_last_source_sync", 0.0),
+            ):
+                selected = admin.ensure_source_repo(force=True)
+
+        self.assertEqual(selected, root.resolve())
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(
+            commands,
+            [
+                ["git", "fetch", "origin", "main"],
+                ["git", "checkout", "main"],
+                ["git", "merge", "--ff-only", "origin/main"],
+            ],
+        )
+        self.assertFalse(any(command[:2] == ["git", "pull"] for command in commands))
+        self.assertEqual(ensure_clean.call_count, 2)
+
+
 class AnalyticsTests(unittest.TestCase):
     def setUp(self):
         admin._stats_cache_key = None
@@ -506,45 +572,166 @@ class AnalyticsTests(unittest.TestCase):
         self.assertEqual(stats["totals"]["todayPv"], 3)
         self.assertEqual(stats["totals"]["todayUv"], 2)
 
-    def test_stats_cache_ignores_log_metadata_changes_until_ttl_expires(self):
+    def test_first_stats_load_is_synchronous_and_single_flight(self):
+        started = threading.Event()
+        release = threading.Event()
         first_result = {"generation": 1}
-        refreshed_result = {"generation": 2}
+
+        def parse(_path):
+            started.set()
+            self.assertTrue(release.wait(timeout=5))
+            return first_result
 
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "access.log"
             log_path.write_text("first\n", encoding="utf-8")
             with (
-                patch.dict(
-                    os.environ, {"BLOG_ADMIN_STATS_CACHE_SECONDS": "60"}
-                ),
+                patch.object(
+                    admin, "_parse_access_log_uncached", side_effect=parse
+                ) as parse_uncached,
+                ThreadPoolExecutor(max_workers=6) as executor,
+            ):
+                futures = [
+                    executor.submit(parse_access_log, log_path) for _ in range(6)
+                ]
+                self.assertTrue(started.wait(timeout=5))
+                self.assertFalse(futures[0].done())
+                release.set()
+                results = [future.result(timeout=5) for future in futures]
+
+        self.assertTrue(all(result is first_result for result in results))
+        self.assertEqual(parse_uncached.call_count, 1)
+
+    def test_expired_stats_cache_is_stale_while_single_refresh_runs(self):
+        started = threading.Event()
+        release = threading.Event()
+        stale_result = {"generation": 1}
+        refreshed_result = {"generation": 2}
+
+        def refresh(_path):
+            started.set()
+            self.assertTrue(release.wait(timeout=5))
+            return refreshed_result
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "access.log"
+            log_path.write_text("first\n", encoding="utf-8")
+            admin._stats_cache_key = (
+                str(log_path),
+                log_path.stat().st_mtime_ns,
+                log_path.stat().st_size,
+            )
+            admin._stats_cache_value = stale_result
+            admin._stats_cache_expires_at = 0.0
+            with (
+                patch.object(
+                    admin, "_parse_access_log_uncached", side_effect=refresh
+                ) as parse_uncached,
+                ThreadPoolExecutor(max_workers=8) as executor,
+            ):
+                try:
+                    results = list(
+                        executor.map(
+                            lambda _index: parse_access_log(log_path), range(8)
+                        )
+                    )
+                    self.assertTrue(started.wait(timeout=5))
+                    self.assertTrue(all(result is stale_result for result in results))
+                    self.assertEqual(parse_uncached.call_count, 1)
+                finally:
+                    release.set()
+
+                self.assertTrue(admin.stats_refresh_lock.acquire(timeout=5))
+                admin.stats_refresh_lock.release()
+                refreshed = parse_access_log(log_path)
+
+        self.assertIs(refreshed, refreshed_result)
+        self.assertEqual(parse_uncached.call_count, 1)
+
+    def test_stats_cache_defaults_to_five_minutes(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(admin.stats_cache_ttl_seconds(), 300)
+
+    def test_failed_background_refresh_keeps_stale_value_with_backoff(self):
+        stale_result = {"generation": 1}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "access.log"
+            log_path.write_text("first\n", encoding="utf-8")
+            admin._stats_cache_key = (
+                str(log_path),
+                log_path.stat().st_mtime_ns,
+                log_path.stat().st_size,
+            )
+            admin._stats_cache_value = stale_result
+            admin._stats_cache_expires_at = 0.0
+            with (
                 patch.object(
                     admin,
                     "_parse_access_log_uncached",
-                    side_effect=[first_result, refreshed_result],
+                    side_effect=RuntimeError("refresh failed"),
                 ) as parse_uncached,
-                patch.object(
-                    admin.time,
-                    "monotonic",
-                    side_effect=[100.0, 100.0, 100.0, 120.0, 161.0, 161.0, 161.0],
-                ),
+                self.assertLogs("blog_admin", level="ERROR"),
             ):
-                first = parse_access_log(log_path)
-                first_key = admin._stats_cache_key
-                log_path.write_text(
-                    "second version changes both size and mtime\n",
-                    encoding="utf-8",
-                )
-                cached = parse_access_log(log_path)
-                cached_key = admin._stats_cache_key
-                refreshed = parse_access_log(log_path)
-                refreshed_key = admin._stats_cache_key
+                self.assertIs(parse_access_log(log_path), stale_result)
+                self.assertTrue(admin.stats_refresh_lock.acquire(timeout=5))
+                admin.stats_refresh_lock.release()
+                self.assertGreater(admin._stats_cache_expires_at, 0.0)
+                self.assertIs(parse_access_log(log_path), stale_result)
 
-        self.assertIs(first, first_result)
-        self.assertIs(cached, first_result)
-        self.assertIs(refreshed, refreshed_result)
-        self.assertEqual(first_key, cached_key)
-        self.assertNotEqual(first_key, refreshed_key)
-        self.assertEqual(parse_uncached.call_count, 2)
+        self.assertEqual(parse_uncached.call_count, 1)
+
+    def test_refresh_thread_start_failure_releases_single_flight_lock(self):
+        stale_result = {"generation": 1}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = Path(tmp) / "access.log"
+            log_path.write_text("first\n", encoding="utf-8")
+            admin._stats_cache_key = (
+                str(log_path),
+                log_path.stat().st_mtime_ns,
+                log_path.stat().st_size,
+            )
+            admin._stats_cache_value = stale_result
+            admin._stats_cache_expires_at = 0.0
+            with (
+                patch.object(
+                    admin.threading.Thread,
+                    "start",
+                    side_effect=RuntimeError("thread unavailable"),
+                ),
+                self.assertLogs("blog_admin", level="ERROR"),
+            ):
+                self.assertIs(parse_access_log(log_path), stale_result)
+
+            self.assertTrue(admin.stats_refresh_lock.acquire(blocking=False))
+            admin.stats_refresh_lock.release()
+
+    def test_stats_warmup_runs_in_background_and_contains_failures(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        def warm(_path):
+            started.set()
+            self.assertTrue(release.wait(timeout=5))
+            raise RuntimeError("warmup failed")
+
+        with (
+            patch.object(admin, "parse_access_log", side_effect=warm),
+            self.assertLogs("blog_admin", level="ERROR") as captured,
+        ):
+            thread = admin.start_stats_cache_warmup()
+            self.assertIsNotNone(thread)
+            self.assertTrue(started.wait(timeout=5))
+            assert thread is not None
+            self.assertTrue(thread.is_alive())
+            release.set()
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(
+            any("unable to warm analytics cache" in line for line in captured.output)
+        )
 
 
 class ContentSnapshotTests(unittest.TestCase):
