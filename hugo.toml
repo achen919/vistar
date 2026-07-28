@@ -15,6 +15,15 @@ theme = 'PaperMod'
   
   # 站内访问统计（由 Nginx 访问日志聚合，不加载第三方脚本）
   siteStats = true
+
+[params.assets]
+  favicon = '/icons/chen-mark.svg'
+  favicon16x16 = '/icons/chen-mark-16.png'
+  favicon32x32 = '/icons/chen-mark-32.png'
+  apple_touch_icon = '/icons/chen-mark-180.png'
+  safari_pinned_tab = '/icons/chen-mask.svg'
+  theme_color = '#4f46e5'
+  msapplication_TileColor = '#4f46e5'
   
   # 评论系统 - Giscus (需要配置 GitHub 仓库)
   # 取消下面的注释并填入你的 GitHub 仓库信息
@@ -29,6 +38,11 @@ theme = 'PaperMod'
   #   inputPosition = 'top'
   #   theme = 'preferred_color_scheme'
   #   lang = 'zh-CN'
+
+[params.label]
+  text = '阿辰的博客'
+  icon = '/icons/chen-mark.svg'
+  iconHeight = 30
 
 [params.homeInfoParams]
   Title = '你好，欢迎来到阿辰的博客 👋'

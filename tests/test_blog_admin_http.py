@@ -24,6 +24,7 @@ class BlogAdminHTTPTests(unittest.TestCase):
         access_log = root / "access.log"
         access_log.write_text("", encoding="utf-8")
         cls.revocation_path = root / "session-revocations.jsonl"
+        cls.todo_path = root / "todos.json"
         password_hash = admin.hash_password(cls.password, iterations=200_000)
         cls.environment = patch.dict(
             os.environ,
@@ -35,6 +36,7 @@ class BlogAdminHTTPTests(unittest.TestCase):
                 "BLOG_ADMIN_ALLOWED_ORIGINS": cls.origin,
                 "BLOG_ADMIN_AUDIT_LOG": str(root / "audit.log"),
                 "BLOG_ADMIN_REVOCATION_FILE": str(cls.revocation_path),
+                "BLOG_ADMIN_TODO_FILE": str(cls.todo_path),
                 "BLOG_ADMIN_ACCESS_LOG": str(access_log),
                 "BLOG_ADMIN_SOURCE_DIR": str(source),
                 "BLOG_ADMIN_REPO_URL": "",
@@ -61,19 +63,26 @@ class BlogAdminHTTPTests(unittest.TestCase):
         admin.revoked_sessions.clear()
         admin._revocations_loaded_file = None
         self.revocation_path.unlink(missing_ok=True)
+        self.todo_path.unlink(missing_ok=True)
 
     def tearDown(self):
         admin.login_failures.clear()
         admin.revoked_sessions.clear()
         admin._revocations_loaded_file = None
         self.revocation_path.unlink(missing_ok=True)
+        self.todo_path.unlink(missing_ok=True)
 
-    def request(self, method, path, *, payload=None, headers=None):
+    def request(self, method, path, *, payload=None, raw_body=None, headers=None):
         request_headers = dict(headers or {})
         body = None
+        if payload is not None and raw_body is not None:
+            raise ValueError("payload and raw_body are mutually exclusive")
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
             request_headers.setdefault("Content-Type", "application/json")
+            request_headers["Content-Length"] = str(len(body))
+        elif raw_body is not None:
+            body = raw_body
             request_headers["Content-Length"] = str(len(body))
         connection = http.client.HTTPConnection(self.host, self.port, timeout=5)
         try:
@@ -101,6 +110,31 @@ class BlogAdminHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["authenticated"])
         return headers["set-cookie"].split(";", 1)[0], payload["csrfToken"]
+
+    def authenticated_headers(self):
+        cookie, csrf_token = self.login()
+        return {
+            "Cookie": cookie,
+            "Origin": self.origin,
+            "Sec-Fetch-Site": "same-origin",
+            "X-CSRF-Token": csrf_token,
+        }
+
+    @staticmethod
+    def multipart_image(
+        content: bytes,
+        *,
+        filename: str = "cover.png",
+        mime_type: str = "image/png",
+    ):
+        boundary = "----BlogAdminBoundary7MA4YWxk"
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+            f"Content-Type: {mime_type}\r\n"
+            "\r\n"
+        ).encode("utf-8") + content + f"\r\n--{boundary}--\r\n".encode("ascii")
+        return body, f"multipart/form-data; boundary={boundary}"
 
     def test_session_endpoint_is_public_but_reports_logged_out(self):
         status, headers, payload = self.request("GET", "/api/session")
@@ -207,6 +241,134 @@ class BlogAdminHTTPTests(unittest.TestCase):
 
         self.assertEqual(status, 403)
         self.assertEqual(payload["code"], "invalid_origin")
+
+    def test_image_upload_requires_csrf_and_passes_validated_multipart(self):
+        content = b"valid-image-content"
+        body, content_type = self.multipart_image(content)
+        cookie, csrf_token = self.login()
+        common = {
+            "Cookie": cookie,
+            "Origin": self.origin,
+            "Sec-Fetch-Site": "same-origin",
+            "Content-Type": content_type,
+        }
+
+        status, _, payload = self.request(
+            "POST",
+            "/api/uploads/images",
+            raw_body=body,
+            headers=common,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["code"], "invalid_csrf")
+
+        expected = {
+            "url": "/uploads/2026/07/random.png",
+            "markdown": "![cover](/uploads/2026/07/random.png)",
+            "filename": "random.png",
+            "mimeType": "image/png",
+            "size": len(content),
+            "commit": "abc123",
+        }
+        with patch.object(admin, "upload_image", return_value=expected) as upload:
+            status, _, payload = self.request(
+                "POST",
+                "/api/uploads/images",
+                raw_body=body,
+                headers={**common, "X-CSRF-Token": csrf_token},
+            )
+
+        self.assertEqual(status, 201)
+        self.assertEqual(payload, expected)
+        upload.assert_called_once_with("cover.png", "image/png", content)
+
+    def test_image_upload_rejects_non_multipart_after_authentication(self):
+        headers = self.authenticated_headers()
+        status, _, payload = self.request(
+            "POST",
+            "/api/uploads/images",
+            raw_body=b"not multipart",
+            headers={**headers, "Content-Type": "application/octet-stream"},
+        )
+
+        self.assertEqual(status, 415)
+        self.assertEqual(payload["code"], "invalid_content_type")
+
+    def test_todo_crud_stats_and_not_found_http_contract(self):
+        headers = self.authenticated_headers()
+        status, _, created = self.request(
+            "POST",
+            "/api/todos",
+            payload={"title": "完成后端", "date": "2026-07-28"},
+            headers=headers,
+        )
+        self.assertEqual(status, 201)
+        todo_id = created["id"]
+
+        status, _, payload = self.request(
+            "GET",
+            "/api/todos?date=2026-07-28",
+            headers={"Cookie": headers["Cookie"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["summary"]["total"], 1)
+        self.assertEqual(payload["todos"][0]["title"], "完成后端")
+
+        status, _, updated = self.request(
+            "PUT",
+            f"/api/todos/{todo_id}",
+            payload={"completed": True},
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(updated["completed"])
+        self.assertTrue(updated["completedAt"])
+
+        status, _, stats = self.request(
+            "GET",
+            "/api/todos/stats?days=1&endDate=2026-07-28",
+            headers={"Cookie": headers["Cookie"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(stats["totals"]["total"], 1)
+        self.assertEqual(stats["totals"]["completed"], 1)
+        self.assertEqual(stats["daily"][0]["completionRate"], 100)
+
+        status, _, deleted = self.request(
+            "DELETE", f"/api/todos/{todo_id}", headers=headers
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(deleted, {"ok": True, "id": todo_id})
+        status, _, missing = self.request(
+            "DELETE", f"/api/todos/{todo_id}", headers=headers
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(missing["code"], "todo_not_found")
+
+    def test_todo_write_rejects_missing_csrf_and_invalid_date(self):
+        cookie, csrf_token = self.login()
+        common = {
+            "Cookie": cookie,
+            "Origin": self.origin,
+            "Sec-Fetch-Site": "same-origin",
+        }
+        status, _, payload = self.request(
+            "POST",
+            "/api/todos",
+            payload={"title": "unsafe", "date": "2026-07-28"},
+            headers=common,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["code"], "invalid_csrf")
+
+        status, _, payload = self.request(
+            "POST",
+            "/api/todos",
+            payload={"title": "bad date", "date": "2026-02-30"},
+            headers={**common, "X-CSRF-Token": csrf_token},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(payload["code"], "invalid_todo_date")
 
 
 if __name__ == "__main__":

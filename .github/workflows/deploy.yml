@@ -23,6 +23,17 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Install admin Python dependencies
+        run: |
+          set -euo pipefail
+
+          python3 -m venv "$RUNNER_TEMP/blog-admin-venv"
+          "$RUNNER_TEMP/blog-admin-venv/bin/python" \
+            -m pip install \
+            --disable-pip-version-check \
+            --requirement requirements-admin.txt
+          printf '%s\n' "$RUNNER_TEMP/blog-admin-venv/bin" >> "$GITHUB_PATH"
+
       - name: Validate admin code before deployment
         run: |
           set -euo pipefail
@@ -166,6 +177,11 @@ jobs:
           current_path="$deploy_path/public"
           rollback_marker="$release_root/.previous-$release_id"
           source_backup="/www/wwwroot/blog-source-rollbacks/$release_id"
+          nginx_config="/www/server/panel/vhost/nginx/blog.conf"
+          nginx_backup="${nginx_config}.rollback-${release_id}.bak"
+          nginx_restore_temp="${nginx_config}.restore-${release_id}.tmp"
+          nginx_backup_ready=0
+          nginx_bin=""
           service_installed=0
 
           if systemctl list-unit-files blog-admin.service >/dev/null 2>&1; then
@@ -187,10 +203,73 @@ jobs:
             done
             return 1
           }
+          require_admin_python_dependencies() {
+            python3 - <<'PILLOW_CHECK'
+          from PIL import features
+
+          required = ("jpg", "zlib", "webp")
+          missing = [name for name in required if not features.check(name)]
+          if missing:
+              raise SystemExit(
+                  "Pillow is missing required codecs: " + ", ".join(missing)
+              )
+          PILLOW_CHECK
+          }
+          resolve_nginx_bin() {
+            if [ -x /www/server/nginx/sbin/nginx ]; then
+              nginx_bin="/www/server/nginx/sbin/nginx"
+              return 0
+            fi
+            nginx_bin="$(command -v nginx || true)"
+            if [ -z "$nginx_bin" ] || [ ! -x "$nginx_bin" ]; then
+              echo "Unable to locate the active Nginx executable." >&2
+              return 1
+            fi
+          }
+          restore_nginx_config() {
+            if [ "$nginx_backup_ready" -ne 1 ]; then
+              return 0
+            fi
+            if \
+              [ ! -f "$nginx_config" ] \
+              || [ -L "$nginx_config" ] \
+              || [ ! -f "$nginx_backup" ] \
+              || [ -L "$nginx_backup" ]; then
+              echo "Refusing to restore an unsafe Nginx config or backup." >&2
+              return 1
+            fi
+            if [ -e "$nginx_restore_temp" ] || [ -L "$nginx_restore_temp" ]; then
+              echo "Nginx restore path already exists: $nginx_restore_temp" >&2
+              return 1
+            fi
+            if ! cp -p "$nginx_backup" "$nginx_restore_temp"; then
+              return 1
+            fi
+            if [ ! -f "$nginx_restore_temp" ] || [ -L "$nginx_restore_temp" ]; then
+              echo "Nginx restore copy is not a regular file." >&2
+              return 1
+            fi
+            if ! mv -f "$nginx_restore_temp" "$nginx_config"; then
+              return 1
+            fi
+            if [ ! -f "$nginx_config" ] || [ -L "$nginx_config" ]; then
+              echo "Restored Nginx config is not a regular file." >&2
+              return 1
+            fi
+            if ! "$nginx_bin" -t; then
+              return 1
+            fi
+            "$nginx_bin" -s reload
+          }
           rollback_source_on_error() {
             status=$?
+            trap - EXIT
             if [ "$status" -ne 0 ]; then
               set +e
+              nginx_rollback_failed=0
+              if ! restore_nginx_config; then
+                nginx_rollback_failed=1
+              fi
               if [ -d "$source_backup" ]; then
                 rsync -a --delete \
                   --exclude '.git' \
@@ -202,6 +281,9 @@ jobs:
               if [ "$service_installed" -eq 1 ]; then
                 systemctl restart blog-admin.service
                 wait_for_admin
+              fi
+              if [ "$nginx_rollback_failed" -ne 0 ]; then
+                echo "Nginx config rollback failed; manual recovery is required." >&2
               fi
               set -e
             fi
@@ -243,14 +325,154 @@ jobs:
             admin/pages/articles.js \
             admin/pages/editor.js \
             admin/pages/categories.js \
-            admin/pages/analytics.js; do
+            admin/pages/todos.js \
+            admin/pages/analytics.js \
+            icons/chen-mark.svg \
+            icons/chen-mark-16.png \
+            icons/chen-mark-32.png \
+            icons/chen-mark-180.png \
+            icons/chen-mask.svg; do
             test -f "$release_path/$required_asset"
           done
 
           if [ "$service_installed" -eq 1 ]; then
+            require_admin_python_dependencies
             systemctl restart blog-admin.service
             systemctl is-active --quiet blog-admin.service
             wait_for_admin
+          fi
+
+          case "$release_id" in
+            *[!A-Za-z0-9._-]* | "")
+              echo "Unsafe release identifier for Nginx backup: $release_id" >&2
+              exit 1
+              ;;
+          esac
+          if [ ! -f "$nginx_config" ] || [ -L "$nginx_config" ]; then
+            echo "Refusing non-regular or symbolic-link Nginx config: $nginx_config" >&2
+            exit 1
+          fi
+          if [ -e "$nginx_backup" ] || [ -L "$nginx_backup" ]; then
+            echo "Nginx rollback backup already exists: $nginx_backup" >&2
+            exit 1
+          fi
+          if [ -e "$nginx_restore_temp" ] || [ -L "$nginx_restore_temp" ]; then
+            echo "Nginx restore path already exists: $nginx_restore_temp" >&2
+            exit 1
+          fi
+          resolve_nginx_bin
+          cp -p "$nginx_config" "$nginx_backup"
+          if [ ! -f "$nginx_backup" ] || [ -L "$nginx_backup" ]; then
+            echo "Nginx rollback backup is not a regular file." >&2
+            exit 1
+          fi
+          nginx_backup_ready=1
+
+          nginx_patch_result="$(
+            python3 - "$nginx_config" <<'PY'
+          import os
+          import stat
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          file_stat = os.lstat(path)
+          if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
+              raise SystemExit("Active Nginx config must be a non-symlink regular file")
+
+          source = path.read_text(encoding="utf-8")
+          api_location = "    location ^~ /admin/api/ {\n"
+          api_before = (
+              "    location ^~ /admin/api/ {\n"
+              "        access_log off;\n"
+              "        proxy_pass http://127.0.0.1:18080/api/;\n"
+          )
+          api_after = (
+              "    location ^~ /admin/api/ {\n"
+              "        access_log off;\n"
+              "        client_max_body_size 8m;\n"
+              "        proxy_pass http://127.0.0.1:18080/api/;\n"
+          )
+          csp_before = (
+              "        add_header Content-Security-Policy "
+              "\"default-src 'self'; script-src 'self'; style-src 'self'; "
+              "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+              "base-uri 'none'; frame-ancestors 'none'; form-action 'self'\" always;"
+          )
+          csp_after = (
+              "        add_header Content-Security-Policy "
+              "\"default-src 'self'; script-src 'self'; style-src 'self'; "
+              "img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; "
+              "base-uri 'none'; frame-ancestors 'none'; form-action 'self'\" always;"
+          )
+
+          if source.count(api_location) != 1:
+              raise SystemExit("Expected exactly one /admin/api/ location")
+          api_before_count = source.count(api_before)
+          api_after_count = source.count(api_after)
+          if (api_before_count, api_after_count) == (1, 0):
+              updated = source.replace(api_before, api_after, 1)
+          elif (api_before_count, api_after_count) == (0, 1):
+              updated = source
+          else:
+              raise SystemExit("Unexpected /admin/api/ location shape")
+
+          if source.count("add_header Content-Security-Policy ") != 2:
+              raise SystemExit("Expected exactly two admin CSP directives")
+          csp_before_count = updated.count(csp_before)
+          csp_after_count = updated.count(csp_after)
+          if (csp_before_count, csp_after_count) == (2, 0):
+              updated = updated.replace(csp_before, csp_after)
+          elif (csp_before_count, csp_after_count) != (0, 2):
+              raise SystemExit("Unexpected admin CSP directive shape")
+
+          if updated == source:
+              print("unchanged")
+              raise SystemExit(0)
+
+          descriptor, temporary_name = tempfile.mkstemp(
+              dir=path.parent,
+              prefix=".blog.conf.patch-",
+          )
+          try:
+              os.fchmod(descriptor, stat.S_IMODE(file_stat.st_mode))
+              os.fchown(descriptor, file_stat.st_uid, file_stat.st_gid)
+              with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+                  temporary.write(updated)
+                  temporary.flush()
+                  os.fsync(temporary.fileno())
+              descriptor = -1
+              os.replace(temporary_name, path)
+              directory_descriptor = os.open(path.parent, os.O_DIRECTORY)
+              try:
+                  os.fsync(directory_descriptor)
+              finally:
+                  os.close(directory_descriptor)
+          finally:
+              if descriptor >= 0:
+                  os.close(descriptor)
+              try:
+                  os.unlink(temporary_name)
+              except FileNotFoundError:
+                  pass
+          print("changed")
+          PY
+          )"
+          case "$nginx_patch_result" in
+            changed | unchanged) ;;
+            *)
+              echo "Unexpected Nginx patch result." >&2
+              exit 1
+              ;;
+          esac
+          if [ ! -f "$nginx_config" ] || [ -L "$nginx_config" ]; then
+            echo "Patched Nginx config is not a regular file." >&2
+            exit 1
+          fi
+          "$nginx_bin" -t
+          if [ "$nginx_patch_result" = "changed" ]; then
+            "$nginx_bin" -s reload
           fi
 
           ln -s "$release_path" "$next_link"
@@ -288,6 +510,7 @@ jobs:
             fi
             exit 1
           fi
+          nginx_backup_ready=0
           trap - EXIT
           REMOTE_SCRIPT
 
@@ -299,6 +522,20 @@ jobs:
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
           set -euo pipefail
+
+          EXPECTED_REMOTE_PATH="/www/wwwroot/blog"
+          REMOTE_PATH="${DEPLOY_PATH:-$EXPECTED_REMOTE_PATH}"
+          if [[ "$REMOTE_PATH" != "$EXPECTED_REMOTE_PATH" ]]; then
+            echo "DEPLOY_PATH must remain $EXPECTED_REMOTE_PATH" >&2
+            exit 1
+          fi
+          : "${DEPLOY_HOST:?Missing DEPLOY_HOST secret}"
+          : "${DEPLOY_USER:?Missing DEPLOY_USER secret}"
+          : "${DEPLOY_PASSWORD:?Missing DEPLOY_PASSWORD secret}"
+
+          export SSHPASS="$DEPLOY_PASSWORD"
+          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+          REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
 
           set +e
           (
@@ -317,6 +554,28 @@ jobs:
             https://shcxyz.site/admin/
           if grep -Eiq '^www-authenticate:' "$ADMIN_HEADERS"; then
             echo "Legacy HTTP Basic Auth is still active on /admin/." >&2
+            exit 1
+          fi
+          if ! grep -Eiq \
+              "^content-security-policy:.*img-src 'self' data: blob:;" \
+              "$ADMIN_HEADERS"; then
+            echo "Admin HTML CSP does not allow local image previews." >&2
+            exit 1
+          fi
+
+          ADMIN_ASSET_HEADERS="$RUNNER_TEMP/admin-asset-headers.txt"
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --max-time 20 \
+            --dump-header "$ADMIN_ASSET_HEADERS" \
+            --output /dev/null \
+            https://shcxyz.site/admin/admin.js
+          if ! grep -Eiq \
+              "^content-security-policy:.*img-src 'self' data: blob:;" \
+              "$ADMIN_ASSET_HEADERS"; then
+            echo "Admin asset CSP does not allow local image previews." >&2
             exit 1
           fi
 
@@ -416,6 +675,49 @@ jobs:
               https://shcxyz.site/admin/pages/__missing_module_probe__.js
           )"
           test "$MISSING_MODULE_STATUS" = "404"
+
+          $SSH_CMD "$REMOTE" sh -s <<'VERIFY_NGINX_SCRIPT'
+          set -eu
+
+          nginx_config="/www/server/panel/vhost/nginx/blog.conf"
+          if [ ! -f "$nginx_config" ] || [ -L "$nginx_config" ]; then
+            echo "Active Nginx config is not a non-symlink regular file." >&2
+            exit 1
+          fi
+          python3 - "$nginx_config" <<'PY'
+          import os
+          import stat
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          file_stat = os.lstat(path)
+          if stat.S_ISLNK(file_stat.st_mode) or not stat.S_ISREG(file_stat.st_mode):
+              raise SystemExit("Active Nginx config must be a regular file")
+
+          source = path.read_text(encoding="utf-8")
+          api_after = (
+              "    location ^~ /admin/api/ {\n"
+              "        access_log off;\n"
+              "        client_max_body_size 8m;\n"
+              "        proxy_pass http://127.0.0.1:18080/api/;\n"
+          )
+          csp_after = (
+              "        add_header Content-Security-Policy "
+              "\"default-src 'self'; script-src 'self'; style-src 'self'; "
+              "img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; "
+              "base-uri 'none'; frame-ancestors 'none'; form-action 'self'\" always;"
+          )
+          if source.count("    location ^~ /admin/api/ {\n") != 1:
+              raise SystemExit("Unexpected /admin/api/ location count")
+          if source.count(api_after) != 1:
+              raise SystemExit("Active /admin/api/ body limit is not 8m")
+          if source.count("add_header Content-Security-Policy ") != 2:
+              raise SystemExit("Unexpected admin CSP count")
+          if source.count(csp_after) != 2:
+              raise SystemExit("Active admin CSP does not allow blob images")
+          PY
+          VERIFY_NGINX_SCRIPT
           )
           verification_status=$?
           set -e
@@ -424,19 +726,6 @@ jobs:
             exit 0
           fi
 
-          EXPECTED_REMOTE_PATH="/www/wwwroot/blog"
-          REMOTE_PATH="${DEPLOY_PATH:-$EXPECTED_REMOTE_PATH}"
-          if [[ "$REMOTE_PATH" != "$EXPECTED_REMOTE_PATH" ]]; then
-            echo "DEPLOY_PATH must remain $EXPECTED_REMOTE_PATH" >&2
-            exit 1
-          fi
-          : "${DEPLOY_HOST:?Missing DEPLOY_HOST secret}"
-          : "${DEPLOY_USER:?Missing DEPLOY_USER secret}"
-          : "${DEPLOY_PASSWORD:?Missing DEPLOY_PASSWORD secret}"
-
-          export SSHPASS="$DEPLOY_PASSWORD"
-          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
-          REMOTE="${DEPLOY_USER}@${DEPLOY_HOST}"
           $SSH_CMD "$REMOTE" sh -s -- \
             "$REMOTE_PATH" \
             "$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" <<'ROLLBACK_SCRIPT'
@@ -449,6 +738,10 @@ jobs:
           current_path="$deploy_path/public"
           rollback_link="$deploy_path/.public-rollback-$release_id"
           source_backup="/www/wwwroot/blog-source-rollbacks/$release_id"
+          nginx_config="/www/server/panel/vhost/nginx/blog.conf"
+          nginx_backup="${nginx_config}.rollback-${release_id}.bak"
+          nginx_restore_temp="${nginx_config}.verify-restore-${release_id}.tmp"
+          nginx_bin=""
           wait_for_admin() {
             attempt=1
             while [ "$attempt" -le 30 ]; do
@@ -464,6 +757,44 @@ jobs:
               attempt=$((attempt + 1))
             done
             return 1
+          }
+          resolve_nginx_bin() {
+            if [ -x /www/server/nginx/sbin/nginx ]; then
+              nginx_bin="/www/server/nginx/sbin/nginx"
+              return 0
+            fi
+            nginx_bin="$(command -v nginx || true)"
+            if [ -z "$nginx_bin" ] || [ ! -x "$nginx_bin" ]; then
+              echo "Unable to locate the active Nginx executable." >&2
+              return 1
+            fi
+          }
+          restore_nginx_config() {
+            if \
+              [ ! -f "$nginx_config" ] \
+              || [ -L "$nginx_config" ] \
+              || [ ! -f "$nginx_backup" ] \
+              || [ -L "$nginx_backup" ]; then
+              echo "Refusing to restore an unsafe Nginx config or backup." >&2
+              return 1
+            fi
+            if [ -e "$nginx_restore_temp" ] || [ -L "$nginx_restore_temp" ]; then
+              echo "Nginx verify rollback path already exists: $nginx_restore_temp" >&2
+              return 1
+            fi
+            cp -p "$nginx_backup" "$nginx_restore_temp"
+            if [ ! -f "$nginx_restore_temp" ] || [ -L "$nginx_restore_temp" ]; then
+              echo "Nginx verify rollback copy is not a regular file." >&2
+              return 1
+            fi
+            mv -f "$nginx_restore_temp" "$nginx_config"
+            if [ ! -f "$nginx_config" ] || [ -L "$nginx_config" ]; then
+              echo "Restored Nginx config is not a regular file." >&2
+              return 1
+            fi
+            resolve_nginx_bin
+            "$nginx_bin" -t
+            "$nginx_bin" -s reload
           }
 
           test -f "$rollback_marker"
@@ -490,6 +821,7 @@ jobs:
             --exclude 'resources/_gen/' \
             "$source_backup/" \
             "$deploy_path/"
+          restore_nginx_config
           if systemctl list-unit-files blog-admin.service >/dev/null 2>&1; then
             systemctl restart blog-admin.service
             systemctl is-active --quiet blog-admin.service

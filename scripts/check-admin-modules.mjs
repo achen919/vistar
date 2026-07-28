@@ -4,7 +4,7 @@ import vm from "node:vm";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const adminRoot = path.resolve("static/admin");
-const assetVersion = "20260728-console-2";
+const assetVersion = "20260728-console-3";
 const versionPayload = JSON.parse(
   await fs.readFile(path.join(adminRoot, "version.json"), "utf8"),
 );
@@ -19,6 +19,7 @@ const entrySpecifiers = [
   `pages/articles.js?v=${assetVersion}`,
   `pages/editor.js?v=${assetVersion}`,
   `pages/categories.js?v=${assetVersion}`,
+  `pages/todos.js?v=${assetVersion}`,
   `pages/analytics.js?v=${assetVersion}`,
 ];
 const moduleCache = new Map();
@@ -84,8 +85,8 @@ for (const match of adminSource.matchAll(dynamicRoutePattern)) {
     throw new Error(`${moduleUrl.href} does not export ${exportName}.`);
   }
 }
-if (dynamicRouteCount !== 6) {
-  throw new Error(`Expected 6 lazy admin routes, found ${dynamicRouteCount}.`);
+if (dynamicRouteCount !== 7) {
+  throw new Error(`Expected 7 lazy admin routes, found ${dynamicRouteCount}.`);
 }
 
 console.log(`Linked ${moduleCache.size} admin ESM modules.`);

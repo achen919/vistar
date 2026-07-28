@@ -70,8 +70,9 @@ The console is split into task-focused routes:
 
 - `/admin/` - overview, recent posts, and traffic summary.
 - `/admin/articles/` - searchable article list with create, edit, draft, and delete actions.
-- `/admin/articles/new/` - focused Markdown authoring page.
+- `/admin/articles/new/` - focused Markdown authoring page with authenticated image upload.
 - `/admin/categories/` - category CRUD and persisted drag ordering.
+- `/admin/todos/` - date-based Todo CRUD, completion tracking, and daily completion statistics.
 - `/admin/analytics/` - PV/UV trends, popular pages, and referring sites.
 
 Article editing and category editing are independent. Category responses and
@@ -91,6 +92,15 @@ can inspect `GET /admin/api/publish/status` and retry only the push with
 `POST /admin/api/publish/retry` (the retry request requires the normal CSRF
 header).
 
+Article images are uploaded through the authenticated admin API. PNG, JPEG, GIF,
+and WebP files are fully decoded with Pillow, bounded by dimensions, pixel
+count, and animation frame count, then re-encoded without source metadata before
+they are stored under `static/uploads/` and published through the same Git/Hugo
+workflow. SVG, AVIF, malformed images, decompression bombs, and files larger than
+the configured 5 MiB application limit are rejected. Todo data is operational
+admin state rather than blog content; it is atomically stored in
+`/var/lib/blog-admin/todos.json` and is not committed to the public repository.
+
 Traffic data is aggregated from the local Nginx access log. PV excludes admin,
 API, static-asset, failed, and known bot requests. UV is a keyed HMAC of IP and
 user agent; raw visitor identifiers are never returned or persisted by the
@@ -105,6 +115,13 @@ Server setup files:
 - `deploy/systemd/blog-admin.service` - systemd unit.
 - `deploy/install-blog-admin.sh` - server installer.
 - `deploy/blog-admin.env.example` - environment template.
+
+Local validation requires Pillow:
+
+```bash
+python3 -m pip install -r requirements-admin.txt
+./scripts/validate-blog-config.sh
+```
 
 Do not commit admin passwords, SSH private keys, or unverified host keys. The
 installer creates a dedicated, non-login `blog-admin` system user, stores its

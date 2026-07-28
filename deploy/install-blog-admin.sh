@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+set +x
+umask 077
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run this script as root on the blog server." >&2
@@ -8,6 +10,7 @@ fi
 
 BLOG_ADMIN_USER="${BLOG_ADMIN_USER:-admin}"
 BLOG_ADMIN_PASSWORD="${BLOG_ADMIN_PASSWORD:-}"
+export -n BLOG_ADMIN_PASSWORD
 BLOG_ADMIN_SERVICE_USER="blog-admin"
 BLOG_ADMIN_STATE_DIR="${BLOG_ADMIN_STATE_DIR:-/var/lib/blog-admin}"
 BLOG_ADMIN_SOURCE_DIR="${BLOG_ADMIN_SOURCE_DIR:-/www/wwwroot/blog-admin-source}"
@@ -29,14 +32,40 @@ if [[ ! "${BLOG_ADMIN_USER}" =~ ^[A-Za-z0-9_.@-]{1,64}$ ]]; then
   exit 1
 fi
 for required_command in \
-  awk chgrp chmod chown cp curl date dirname find getent git hugo id install mv \
-  nginx openssl python3 runuser sed seq sleep ssh ssh-keygen stat systemctl \
-  tr useradd usermod; do
+  awk chgrp chmod chown cp curl date dirname env find getent git hugo id install \
+  mktemp mv nginx openssl python3 rm runuser sed seq sleep ssh ssh-keygen stat \
+  systemctl tr useradd usermod; do
   if ! command -v "${required_command}" >/dev/null 2>&1; then
     echo "${required_command} is required on the server." >&2
     exit 1
   fi
 done
+
+pillow_is_ready() {
+  python3 - <<'PY' >/dev/null 2>&1
+from PIL import features
+
+required = ("jpg", "zlib", "webp")
+raise SystemExit(0 if all(features.check(name) for name in required) else 1)
+PY
+}
+
+if ! pillow_is_ready; then
+  if command -v dnf >/dev/null 2>&1; then
+    env -u BLOG_ADMIN_PASSWORD dnf install -y python3-pillow
+  elif command -v apt-get >/dev/null 2>&1; then
+    env -u BLOG_ADMIN_PASSWORD apt-get update
+    env -u BLOG_ADMIN_PASSWORD apt-get install -y python3-pil
+  else
+    echo "Pillow with JPEG, PNG and WebP support is required." >&2
+    echo "Install the operating system's Python Pillow package and rerun." >&2
+    exit 1
+  fi
+fi
+if ! pillow_is_ready; then
+  echo "Pillow is installed without required JPEG, PNG or WebP support." >&2
+  exit 1
+fi
 
 python3 - \
   "${BLOG_ADMIN_STATE_DIR}" \
@@ -323,6 +352,14 @@ if [[ -z "${ANALYTICS_SECRET}" ]]; then
   ANALYTICS_SECRET="$(openssl rand -base64 48 | tr -d '\n')"
 fi
 
+ENV_TEMP="$(mktemp "${ENV_FILE}.tmp.XXXXXX")"
+cleanup_env_temp() {
+  if [[ -n "${ENV_TEMP:-}" ]]; then
+    rm -f -- "${ENV_TEMP}"
+  fi
+}
+trap cleanup_env_temp EXIT
+
 {
   printf 'BLOG_ADMIN_HOST=127.0.0.1\n'
   printf 'BLOG_ADMIN_PORT=18080\n'
@@ -341,8 +378,14 @@ fi
   printf 'BLOG_ADMIN_TIMEZONE=Asia/Shanghai\n'
   printf 'BLOG_ADMIN_AUDIT_LOG=%s/audit.log\n' "${BLOG_ADMIN_STATE_DIR}"
   printf 'BLOG_ADMIN_REVOCATION_FILE=%s/revoked-sessions.jsonl\n' "${BLOG_ADMIN_STATE_DIR}"
-} > "${ENV_FILE}"
-chmod 600 "${ENV_FILE}"
+  printf 'BLOG_ADMIN_TODO_FILE=%s/todos.json\n' "${BLOG_ADMIN_STATE_DIR}"
+  printf 'BLOG_ADMIN_UPLOAD_MAX_BYTES=5242880\n'
+} > "${ENV_TEMP}"
+chown root:root "${ENV_TEMP}"
+chmod 600 "${ENV_TEMP}"
+mv -f -- "${ENV_TEMP}" "${ENV_FILE}"
+ENV_TEMP=""
+trap - EXIT
 unset BLOG_ADMIN_PASSWORD PASSWORD_HASH SESSION_SECRET ANALYTICS_SECRET
 
 if [[ -z "${BLOG_ADMIN_LOG_GROUP}" && -f "${BLOG_ADMIN_ACCESS_LOG}" ]]; then
