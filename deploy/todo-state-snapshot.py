@@ -19,10 +19,11 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, NoReturn
 
 
 ENV_PATH = Path("/etc/blog-admin.env")
+DEFAULT_STATE_PATH = Path("/var/lib/blog-admin/todos.json")
 BACKUP_PARENT = Path("/var/backups")
 BACKUP_BASE = BACKUP_PARENT / "blog-admin-todos"
 RELEASE_PATTERN = re.compile(r"[A-Za-z0-9._-]+")
@@ -30,7 +31,7 @@ STATE_DIR_PATTERN = re.compile(r"blog-admin(?:-[A-Za-z0-9._-]+)?")
 MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
 
 
-def fail(message: str) -> "NoReturn":
+def fail(message: str) -> NoReturn:
     raise SystemExit(message)
 
 
@@ -69,15 +70,20 @@ def ensure_root_directory(path: Path, label: str) -> None:
     os.chmod(path, 0o700)
 
 
-def resolve_state_path() -> Path:
-    env_stat = lstat_regular(ENV_PATH, "Admin environment")
-    if env_stat.st_uid != 0 or stat.S_IMODE(env_stat.st_mode) & 0o022:
-        fail("Admin environment must be root-owned and not group/world writable")
-    source = ENV_PATH.read_text(encoding="utf-8")
-    matches = re.findall(r"^BLOG_ADMIN_TODO_FILE=([^\r\n]+)$", source, re.MULTILINE)
-    if len(matches) != 1:
-        fail("Expected exactly one BLOG_ADMIN_TODO_FILE setting")
-    raw_path = matches[0]
+def configured_state_path(source: str) -> Path:
+    prefix = "BLOG_ADMIN_TODO_FILE="
+    matches: list[str] = []
+    for line in source.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(prefix):
+            if stripped != line:
+                fail("BLOG_ADMIN_TODO_FILE must not have leading whitespace")
+            matches.append(line.removeprefix(prefix))
+        elif re.match(r"^BLOG_ADMIN_TODO_FILE(?:\s|$)", stripped):
+            fail("BLOG_ADMIN_TODO_FILE must use a canonical KEY=value line")
+    if len(matches) > 1:
+        fail("Expected at most one BLOG_ADMIN_TODO_FILE setting")
+    raw_path = matches[0] if matches else str(DEFAULT_STATE_PATH)
     state_path = Path(raw_path)
     if (
         not state_path.is_absolute()
@@ -87,6 +93,14 @@ def resolve_state_path() -> Path:
         or not STATE_DIR_PATTERN.fullmatch(state_path.parent.name)
     ):
         fail("Todo state path is outside the managed state directory")
+    return state_path
+
+
+def resolve_state_path() -> Path:
+    env_stat = lstat_regular(ENV_PATH, "Admin environment")
+    if env_stat.st_uid != 0 or stat.S_IMODE(env_stat.st_mode) & 0o022:
+        fail("Admin environment must be root-owned and not group/world writable")
+    state_path = configured_state_path(ENV_PATH.read_text(encoding="utf-8"))
     require_root_owned_directory(Path("/var"), "/var")
     require_root_owned_directory(Path("/var/lib"), "/var/lib")
     lstat_directory(state_path.parent, "Todo state directory")
