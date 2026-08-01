@@ -8,7 +8,7 @@ import {
   renderTags,
   statusBadge,
   unwrap,
-} from "../ui.js?v=20260728-console-4";
+} from "../ui.js?v=20260801-console-5";
 
 export async function renderArticles(context) {
   const { api, container, signal, confirm, toast } = context;

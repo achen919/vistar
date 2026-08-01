@@ -72,7 +72,8 @@ The console is split into task-focused routes:
 - `/admin/articles/` - searchable article list with create, edit, draft, and delete actions.
 - `/admin/articles/new/` - focused Markdown authoring page with authenticated image upload.
 - `/admin/categories/` - category CRUD and persisted drag ordering.
-- `/admin/todos/` - date-based Todo CRUD, completion tracking, and daily completion statistics.
+- `/admin/todos/` - single-date and recurring Todo CRUD, weekday/end-date rules,
+  per-occurrence completion tracking, and daily completion statistics.
 - `/admin/analytics/` - PV/UV trends, popular pages, and referring sites.
 
 Article editing and category editing are independent. Category responses and
@@ -103,6 +104,15 @@ workflow. SVG, AVIF, malformed images, decompression bombs, and files larger tha
 the configured 5 MiB application limit are rejected. Todo data is operational
 admin state rather than blog content; it is atomically stored in
 `/var/lib/blog-admin/todos.json` and is not committed to the public repository.
+Single-date Todo records remain compatible with the original state format.
+Recurring plans store only their start date, optional inclusive end date, ISO
+weekdays, and sparse per-day completion records; future occurrences are derived
+when queried instead of being pre-generated. Version 1 state is read without
+modification and is upgraded atomically on the first subsequent Todo write.
+Production deployment keeps mode-`0600` Todo snapshots below the root-owned
+`/var/backups/blog-admin-todos/` directory. Snapshot and restore operations use
+the application's Todo lock; rollback stops the service first, and preserves a
+separate recovery copy if the state changed during the deployment window.
 
 Traffic data is aggregated from the local Nginx access log. PV excludes admin,
 API, static-asset, failed, and known bot requests. UV is a keyed HMAC of IP and
@@ -119,6 +129,7 @@ Server setup files:
 - `tools/blog_admin_server.py` - localhost-only publish API.
 - `deploy/systemd/blog-admin.service` - systemd unit.
 - `deploy/install-blog-admin.sh` - server installer.
+- `deploy/todo-state-snapshot.py` - locked, root-only deployment snapshots.
 - `deploy/blog-admin.env.example` - environment template.
 
 Local validation requires Pillow:

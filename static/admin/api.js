@@ -225,4 +225,29 @@ export const api = {
       signal,
     });
   },
+  todoPlans(signal) {
+    return request("/todo-plans", { signal });
+  },
+  createTodoPlan(plan, signal) {
+    return request("/todo-plans", { method: "POST", body: plan, signal });
+  },
+  updateTodoPlan(identifier, plan, signal) {
+    return request(`/todo-plans/${encodeURIComponent(identifier)}`, {
+      method: "PUT",
+      body: plan,
+      signal,
+    });
+  },
+  deleteTodoPlan(identifier, signal) {
+    return request(`/todo-plans/${encodeURIComponent(identifier)}`, {
+      method: "DELETE",
+      signal,
+    });
+  },
+  updateTodoOccurrence(identifier, date, completed, signal) {
+    return request(
+      `/todo-plans/${encodeURIComponent(identifier)}/occurrences/${encodeURIComponent(date)}`,
+      { method: "PUT", body: { completed }, signal },
+    );
+  },
 };

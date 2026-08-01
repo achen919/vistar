@@ -3,10 +3,10 @@ import {
   ApiError,
   clearCsrfToken,
   setUnauthorizedHandler,
-} from "./api.js?v=20260728-console-4";
-import { escapeHtml, icon } from "./ui.js?v=20260728-console-4";
+} from "./api.js?v=20260801-console-5";
+import { escapeHtml, icon } from "./ui.js?v=20260801-console-5";
 
-const ASSET_VERSION = "20260728-console-4";
+const ASSET_VERSION = "20260801-console-5";
 const ASSET_VERSION_TIMEOUT_MS = 10_000;
 const app = document.querySelector("#app");
 const confirmDialog = document.querySelector("#globalConfirmDialog");
@@ -18,7 +18,7 @@ const routes = [
     section: "dashboard",
     title: "仪表盘",
     description: "博客运营概览",
-    load: () => import("./pages/dashboard.js?v=20260728-console-4")
+    load: () => import("./pages/dashboard.js?v=20260801-console-5")
       .then((module) => module.renderDashboard),
   },
   {
@@ -26,7 +26,7 @@ const routes = [
     section: "articles",
     title: "文章管理",
     description: "管理全部内容与发布状态",
-    load: () => import("./pages/articles.js?v=20260728-console-4")
+    load: () => import("./pages/articles.js?v=20260801-console-5")
       .then((module) => module.renderArticles),
   },
   {
@@ -34,7 +34,7 @@ const routes = [
     section: "articles",
     title: "新建文章",
     description: "撰写并发布新的博客内容",
-    load: () => import("./pages/editor.js?v=20260728-console-4")
+    load: () => import("./pages/editor.js?v=20260801-console-5")
       .then((module) => module.renderEditor),
   },
   {
@@ -42,7 +42,7 @@ const routes = [
     section: "articles",
     title: "编辑文章",
     description: "修改文章内容与发布状态",
-    load: () => import("./pages/editor.js?v=20260728-console-4")
+    load: () => import("./pages/editor.js?v=20260801-console-5")
       .then((module) => module.renderEditor),
   },
   {
@@ -50,7 +50,7 @@ const routes = [
     section: "categories",
     title: "分类管理",
     description: "维护分类并调整前台展示顺序",
-    load: () => import("./pages/categories.js?v=20260728-console-4")
+    load: () => import("./pages/categories.js?v=20260801-console-5")
       .then((module) => module.renderCategories),
   },
   {
@@ -58,7 +58,7 @@ const routes = [
     section: "todos",
     title: "每日 Todo",
     description: "规划今日事项并回顾每日完成情况",
-    load: () => import("./pages/todos.js?v=20260728-console-4")
+    load: () => import("./pages/todos.js?v=20260801-console-5")
       .then((module) => module.renderTodos),
   },
   {
@@ -66,7 +66,7 @@ const routes = [
     section: "analytics",
     title: "数据统计",
     description: "查看网站访问与内容表现",
-    load: () => import("./pages/analytics.js?v=20260728-console-4")
+    load: () => import("./pages/analytics.js?v=20260801-console-5")
       .then((module) => module.renderAnalytics),
   },
 ];

@@ -7,7 +7,7 @@ import {
   slugify,
   today,
   unwrap,
-} from "../ui.js?v=20260728-console-4";
+} from "../ui.js?v=20260801-console-5";
 
 export async function renderEditor(context) {
   const { api, container, signal, navigate, toast, confirm, setLeaveGuard, setTitle } = context;

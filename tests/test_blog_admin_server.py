@@ -1058,6 +1058,333 @@ class TodoTests(unittest.TestCase):
             state = admin.load_todo_state(path)
         self.assertEqual(len(state["todos"]), 40)
 
+    def test_legacy_state_is_read_without_mutation_and_migrates_on_write(self):
+        timestamp = "2026-07-28T08:00:00Z"
+        legacy = {
+            "version": 1,
+            "todos": [
+                {
+                    "id": "todo_" + "a" * 20,
+                    "title": "旧任务",
+                    "date": "2026-07-28",
+                    "completed": True,
+                    "createdAt": timestamp,
+                    "updatedAt": timestamp,
+                    "completedAt": timestamp,
+                }
+            ],
+        }
+        self.state_path.parent.mkdir(parents=True)
+        original = json.dumps(legacy, ensure_ascii=False) + "\n"
+        self.state_path.write_text(original, encoding="utf-8")
+
+        listed = admin.list_todos("2026-07-28")
+        self.assertEqual(listed["todos"][0]["title"], "旧任务")
+        self.assertEqual(self.state_path.read_text(encoding="utf-8"), original)
+
+        admin.create_todo_plan(
+            {
+                "title": "每日复盘",
+                "repeatType": "daily",
+                "startDate": "2026-07-28",
+            }
+        )
+        stored = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["version"], 2)
+        self.assertEqual(stored["todos"][0]["id"], legacy["todos"][0]["id"])
+        self.assertEqual(len(stored["plans"]), 1)
+        self.assertEqual(stored["completions"], [])
+
+    def test_legacy_state_migrates_on_first_ordinary_todo_write(self):
+        timestamp = "2026-07-28T08:00:00Z"
+        legacy_id = "todo_" + "a" * 20
+        legacy = {
+            "version": 1,
+            "todos": [
+                {
+                    "id": legacy_id,
+                    "title": "旧任务",
+                    "date": "2026-07-28",
+                    "completed": False,
+                    "createdAt": timestamp,
+                    "updatedAt": timestamp,
+                    "completedAt": None,
+                }
+            ],
+        }
+        self.state_path.parent.mkdir(parents=True)
+        self.state_path.write_text(
+            json.dumps(legacy, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+
+        created = admin.create_todo(
+            {"title": "普通新任务", "date": "2026-07-29"}
+        )
+
+        stored = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["version"], 2)
+        self.assertEqual(
+            [item["id"] for item in stored["todos"]], [legacy_id, created["id"]]
+        )
+        self.assertEqual(stored["plans"], [])
+        self.assertEqual(stored["completions"], [])
+
+    def test_recurring_plans_expand_on_demand_and_complete_per_day(self):
+        daily = admin.create_todo_plan(
+            {
+                "title": "晨间阅读",
+                "repeatType": "daily",
+                "startDate": "2026-07-30",
+            }
+        )
+        weekly = admin.create_todo_plan(
+            {
+                "title": "周计划",
+                "repeatType": "weekly",
+                "startDate": "2026-07-27",
+                "endDate": "2026-08-02",
+                "weekdays": [1, 7],
+            }
+        )
+
+        thursday = admin.list_todos("2026-07-30")
+        self.assertEqual([item["title"] for item in thursday["todos"]], ["晨间阅读"])
+        monday = admin.list_todos("2026-07-27")
+        self.assertEqual([item["title"] for item in monday["todos"]], ["周计划"])
+        sunday = admin.list_todos("2026-08-02")
+        self.assertEqual([item["title"] for item in sunday["todos"]], ["晨间阅读", "周计划"])
+        self.assertEqual(admin.list_todos("2026-08-03")["summary"]["total"], 1)
+
+        first = admin.update_todo_occurrence(
+            daily["id"], "2026-07-30", {"completed": True}
+        )
+        self.assertTrue(first["completed"])
+        self.assertFalse(admin.list_todos("2026-07-31")["todos"][0]["completed"])
+        admin.update_todo_occurrence(
+            daily["id"], "2026-07-31", {"completed": True}
+        )
+        admin.update_todo_occurrence(
+            daily["id"], "2026-07-30", {"completed": False}
+        )
+        self.assertFalse(admin.list_todos("2026-07-30")["todos"][0]["completed"])
+        self.assertTrue(admin.list_todos("2026-07-31")["todos"][0]["completed"])
+
+        stats = admin.todo_stats(4, "2026-08-02")
+        self.assertEqual(stats["totals"]["total"], 5)
+        self.assertEqual(stats["totals"]["completed"], 1)
+        with admin.locked_todo_store() as path:
+            state = admin.load_todo_state(path)
+        self.assertEqual(len(state["plans"]), 2)
+        self.assertEqual(len(state["completions"]), 1)
+        self.assertEqual(weekly["recurrence"]["weekdays"], [1, 7])
+
+    def test_recurring_occurrence_updated_at_uses_timestamp_order(self):
+        plan_id = "plan_" + "a" * 20
+        self.state_path.parent.mkdir(parents=True)
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "todos": [],
+                    "plans": [
+                        {
+                            "id": plan_id,
+                            "title": "精度回归",
+                            "repeatType": "daily",
+                            "startDate": "2026-08-01",
+                            "endDate": None,
+                            "weekdays": [1, 2, 3, 4, 5, 6, 7],
+                            "createdAt": "2026-08-01T08:00:00Z",
+                            "updatedAt": "2026-08-01T08:00:00Z",
+                        }
+                    ],
+                    "completions": [
+                        {
+                            "planId": plan_id,
+                            "date": "2026-08-01",
+                            "completedAt": "2026-08-01T08:00:00.1Z",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        occurrence = admin.list_todos("2026-08-01")["todos"][0]
+
+        self.assertEqual(occurrence["updatedAt"], "2026-08-01T08:00:00.1Z")
+
+    def test_todo_stats_expands_snapshot_without_holding_store_lock(self):
+        admin.create_todo_plan(
+            {
+                "title": "每日任务",
+                "repeatType": "daily",
+                "startDate": "2026-08-01",
+            }
+        )
+        expansion_started = threading.Event()
+        allow_expansion = threading.Event()
+        original_matches = admin.todo_plan_matches
+
+        def slow_matches(plan, date_value, weekday=None):
+            expansion_started.set()
+            if not allow_expansion.wait(timeout=2):
+                raise AssertionError("Todo statistics expansion timed out")
+            return original_matches(plan, date_value, weekday)
+
+        with (
+            patch.object(admin, "todo_plan_matches", side_effect=slow_matches),
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            stats_future = executor.submit(admin.todo_stats, 1, "2026-08-01")
+            self.assertTrue(expansion_started.wait(timeout=1))
+            create_future = executor.submit(
+                admin.create_todo,
+                {"title": "并发写入", "date": "2026-08-01"},
+            )
+            try:
+                created = create_future.result(timeout=1)
+            finally:
+                allow_expansion.set()
+            stats = stats_future.result(timeout=2)
+
+        self.assertTrue(created["id"].startswith("todo_"))
+        self.assertEqual(stats["totals"]["total"], 1)
+
+    def test_plan_update_prunes_invalid_completions_and_delete_cascades(self):
+        plan = admin.create_todo_plan(
+            {
+                "title": "训练",
+                "repeatType": "weekly",
+                "startDate": "2026-07-27",
+                "weekdays": [1, 3],
+            }
+        )
+        admin.update_todo_occurrence(
+            plan["id"], "2026-07-27", {"completed": True}
+        )
+        admin.update_todo_occurrence(
+            plan["id"], "2026-07-29", {"completed": True}
+        )
+
+        updated = admin.update_todo_plan(
+            plan["id"], {"title": "力量训练", "weekdays": [3]}
+        )
+        self.assertEqual(updated["title"], "力量训练")
+        with admin.locked_todo_store() as path:
+            state = admin.load_todo_state(path)
+        self.assertEqual(
+            [(item["planId"], item["date"]) for item in state["completions"]],
+            [(plan["id"], "2026-07-29")],
+        )
+
+        self.assertEqual(
+            admin.delete_todo_plan(plan["id"]), {"ok": True, "id": plan["id"]}
+        )
+        with admin.locked_todo_store() as path:
+            state = admin.load_todo_state(path)
+        self.assertEqual(state["plans"], [])
+        self.assertEqual(state["completions"], [])
+
+    def test_recurring_plan_validation_and_unscheduled_occurrence(self):
+        invalid_plans = [
+            {
+                "title": "坏计划",
+                "repeatType": "weekly",
+                "startDate": "2026-08-01",
+                "weekdays": [],
+            },
+            {
+                "title": "坏计划",
+                "repeatType": "weekly",
+                "startDate": "2026-08-01",
+                "weekdays": [1, 1],
+            },
+            {
+                "title": "坏计划",
+                "repeatType": "weekly",
+                "startDate": "2026-08-02",
+                "endDate": "2026-08-01",
+                "weekdays": [7],
+            },
+            {
+                "title": "坏计划",
+                "repeatType": "daily",
+                "startDate": "2026-08-01",
+                "weekdays": [True, 2],
+            },
+            {
+                "title": "坏计划",
+                "repeatType": ["daily"],
+                "startDate": "2026-08-01",
+            },
+        ]
+        for payload in invalid_plans:
+            with self.subTest(payload=payload):
+                with self.assertRaises(BlogAdminError):
+                    admin.create_todo_plan(payload)
+
+        plan = admin.create_todo_plan(
+            {
+                "title": "每周一",
+                "repeatType": "weekly",
+                "startDate": "2026-08-01",
+                "weekdays": [1],
+            }
+        )
+        with self.assertRaises(BlogAdminError) as raised:
+            admin.update_todo_occurrence(
+                plan["id"], "2026-08-02", {"completed": True}
+            )
+        self.assertEqual(raised.exception.status, HTTPStatus.CONFLICT)
+        self.assertEqual(raised.exception.code, "todo_occurrence_not_scheduled")
+
+    def test_recurring_completion_updates_are_idempotent_under_concurrency(self):
+        plan = admin.create_todo_plan(
+            {
+                "title": "每日任务",
+                "repeatType": "daily",
+                "startDate": "2026-08-01",
+            }
+        )
+
+        def complete(_: int) -> bool:
+            return admin.update_todo_occurrence(
+                plan["id"], "2026-08-01", {"completed": True}
+            )["completed"]
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            results = list(executor.map(complete, range(24)))
+        self.assertTrue(all(results))
+        with admin.locked_todo_store() as path:
+            state = admin.load_todo_state(path)
+        self.assertEqual(len(state["completions"]), 1)
+
+    def test_orphaned_recurring_completion_fails_closed(self):
+        self.state_path.parent.mkdir(parents=True)
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "todos": [],
+                    "plans": [],
+                    "completions": [
+                        {
+                            "planId": "plan_" + "a" * 20,
+                            "date": "2026-08-01",
+                            "completedAt": "2026-08-01T08:00:00Z",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(BlogAdminError) as raised:
+            admin.list_todos("2026-08-01")
+        self.assertEqual(raised.exception.status, HTTPStatus.INTERNAL_SERVER_ERROR)
+        self.assertEqual(raised.exception.code, "todo_store_invalid")
+
 
 class CrudConsistencyTests(unittest.TestCase):
     def make_root(self, directory: str) -> tuple[Path, list[dict[str, str]]]:

@@ -370,6 +370,67 @@ class BlogAdminHTTPTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(payload["code"], "invalid_todo_date")
 
+    def test_recurring_todo_plan_http_contract(self):
+        headers = self.authenticated_headers()
+        status, _, created = self.request(
+            "POST",
+            "/api/todo-plans",
+            payload={
+                "title": "工作日复盘",
+                "repeatType": "weekly",
+                "startDate": "2026-07-27",
+                "endDate": "2026-07-31",
+                "weekdays": [1, 2, 3, 4, 5],
+            },
+            headers=headers,
+        )
+        self.assertEqual(status, 201)
+        plan_id = created["id"]
+        self.assertEqual(created["recurrence"]["weekdays"], [1, 2, 3, 4, 5])
+
+        status, _, listed = self.request(
+            "GET",
+            "/api/todos?date=2026-07-29",
+            headers={"Cookie": headers["Cookie"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(listed["summary"]["total"], 1)
+        self.assertEqual(listed["todos"][0]["planId"], plan_id)
+        self.assertFalse(listed["todos"][0]["completed"])
+
+        status, _, completed = self.request(
+            "PUT",
+            f"/api/todo-plans/{plan_id}/occurrences/2026-07-29",
+            payload={"completed": True},
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(completed["completed"])
+
+        status, _, stats = self.request(
+            "GET",
+            "/api/todos/stats?days=5&endDate=2026-07-31",
+            headers={"Cookie": headers["Cookie"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(stats["totals"]["total"], 5)
+        self.assertEqual(stats["totals"]["completed"], 1)
+
+        status, _, updated = self.request(
+            "PUT",
+            f"/api/todo-plans/{plan_id}",
+            payload={"title": "晚间复盘", "weekdays": [1, 3, 5]},
+            headers=headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["title"], "晚间复盘")
+
+        status, _, deleted = self.request(
+            "DELETE", f"/api/todo-plans/{plan_id}", headers=headers
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(deleted, {"ok": True, "id": plan_id})
+
 
 if __name__ == "__main__":
     unittest.main()
