@@ -65,8 +65,11 @@ SOURCE_SYNC_INTERVAL_SECONDS = 30
 MAX_CATEGORY_COUNT = 100
 MAX_STATS_DAYS = 365
 MAX_TODO_COUNT = 10_000
+MAX_TODO_PLAN_COUNT = 10_000
+MAX_TODO_COMPLETION_COUNT = 100_000
 MAX_TODO_TITLE_CHARACTERS = 200
 MAX_TODO_TITLE_BYTES = 800
+MAX_TODO_STATE_BYTES = 16 * 1024 * 1024
 CATEGORY_HEADER = "[[params.blogCategories]]"
 CONFIG_SECTION_RE = re.compile(r"^\s*\[")
 FRONT_MATTER_FIELD_RE = re.compile(r"^([A-Za-z0-9_-]+)\s*:")
@@ -122,10 +125,14 @@ PILLOW_IMAGE_FORMATS = {
     "image/webp": "WEBP",
 }
 TODO_ID_RE = re.compile(r"^todo_[A-Za-z0-9_-]{16,64}$")
+TODO_PLAN_ID_RE = re.compile(r"^plan_[A-Za-z0-9_-]{16,64}$")
 TODO_TIMESTAMP_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
 )
-TODO_STATE_VERSION = 1
+TODO_LEGACY_STATE_VERSION = 1
+TODO_STATE_VERSION = 2
+TODO_REPEAT_TYPES = {"daily", "weekly"}
+TODO_ALL_WEEKDAYS = [1, 2, 3, 4, 5, 6, 7]
 
 logger = logging.getLogger("blog_admin")
 publish_lock = threading.RLock()
@@ -1883,6 +1890,14 @@ def validate_todo_id(value: Any) -> str:
     return value
 
 
+def validate_todo_plan_id(value: Any) -> str:
+    if not isinstance(value, str) or not TODO_PLAN_ID_RE.fullmatch(value):
+        raise BlogAdminError(
+            "Todo 重复计划 ID 无效。", code="invalid_todo_plan_id"
+        )
+    return value
+
+
 def validate_todo_timestamp(value: Any, *, nullable: bool = False) -> str | None:
     if value is None and nullable:
         return None
@@ -1892,6 +1907,10 @@ def validate_todo_timestamp(value: Any, *, nullable: bool = False) -> str | None
     if parsed.utcoffset() != dt.timedelta(0):
         raise ValueError("todo timestamp must use UTC")
     return value
+
+
+def todo_timestamp_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def normalize_stored_todo(raw: Any) -> dict[str, Any]:
@@ -1932,6 +1951,131 @@ def normalize_stored_todo(raw: Any) -> dict[str, Any]:
         "createdAt": created_at,
         "updatedAt": updated_at,
         "completedAt": completed_at,
+    }
+
+
+def validate_todo_weekdays(value: Any) -> list[int]:
+    if not isinstance(value, list) or not value:
+        raise BlogAdminError(
+            "重复计划至少需要选择一个星期。",
+            code="invalid_todo_recurrence",
+        )
+    if any(
+        isinstance(item, bool) or not isinstance(item, int) or not 1 <= item <= 7
+        for item in value
+    ):
+        raise BlogAdminError(
+            "重复星期必须使用 1 到 7 表示周一到周日。",
+            code="invalid_todo_recurrence",
+        )
+    if len(value) != len(set(value)):
+        raise BlogAdminError(
+            "重复星期不能重复选择。", code="invalid_todo_recurrence"
+        )
+    return sorted(value)
+
+
+def validate_todo_plan_schedule(
+    repeat_type: Any,
+    start_date: Any,
+    end_date: Any,
+    weekdays: Any,
+) -> dict[str, Any]:
+    if not isinstance(repeat_type, str) or repeat_type not in TODO_REPEAT_TYPES:
+        raise BlogAdminError(
+            "Todo 重复方式无效。", code="invalid_todo_recurrence"
+        )
+    selected_start = validate_todo_date(start_date)
+    if end_date is None:
+        selected_end = None
+    else:
+        selected_end = validate_todo_date(end_date)
+        if selected_end < selected_start:
+            raise BlogAdminError(
+                "重复计划的截止日期不能早于开始日期。",
+                code="invalid_todo_recurrence",
+            )
+    selected_weekdays = validate_todo_weekdays(weekdays)
+    if repeat_type == "daily" and selected_weekdays != TODO_ALL_WEEKDAYS:
+        raise BlogAdminError(
+            "每日固定计划必须包含一周中的每一天。",
+            code="invalid_todo_recurrence",
+        )
+    if selected_end is not None:
+        start = dt.date.fromisoformat(selected_start)
+        end = dt.date.fromisoformat(selected_end)
+        if not any(
+            (candidate := start + dt.timedelta(days=offset)) <= end
+            and candidate.isoweekday() in selected_weekdays
+            for offset in range(7)
+        ):
+            raise BlogAdminError(
+                "所选日期范围内没有符合星期设置的任务。",
+                code="invalid_todo_recurrence",
+            )
+    return {
+        "repeatType": repeat_type,
+        "startDate": selected_start,
+        "endDate": selected_end,
+        "weekdays": selected_weekdays,
+    }
+
+
+def todo_plan_matches(
+    plan: dict[str, Any], date_value: str, weekday: int | None = None
+) -> bool:
+    if date_value < plan["startDate"]:
+        return False
+    if plan["endDate"] is not None and date_value > plan["endDate"]:
+        return False
+    selected_weekday = weekday or dt.date.fromisoformat(date_value).isoweekday()
+    return selected_weekday in plan["weekdays"]
+
+
+def normalize_stored_todo_plan(raw: Any) -> dict[str, Any]:
+    expected_keys = {
+        "id",
+        "title",
+        "repeatType",
+        "startDate",
+        "endDate",
+        "weekdays",
+        "createdAt",
+        "updatedAt",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected_keys:
+        raise ValueError("invalid todo plan schema")
+    schedule = validate_todo_plan_schedule(
+        raw["repeatType"],
+        raw["startDate"],
+        raw["endDate"],
+        raw["weekdays"],
+    )
+    if schedule["weekdays"] != raw["weekdays"]:
+        raise ValueError("todo plan weekdays must be sorted")
+    created_at = validate_todo_timestamp(raw["createdAt"])
+    updated_at = validate_todo_timestamp(raw["updatedAt"])
+    if dt.datetime.fromisoformat(
+        updated_at.replace("Z", "+00:00")
+    ) < dt.datetime.fromisoformat(created_at.replace("Z", "+00:00")):
+        raise ValueError("todo plan updatedAt predates createdAt")
+    return {
+        "id": validate_todo_plan_id(raw["id"]),
+        "title": validate_todo_title(raw["title"]),
+        **schedule,
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+    }
+
+
+def normalize_stored_todo_completion(raw: Any) -> dict[str, Any]:
+    expected_keys = {"planId", "date", "completedAt"}
+    if not isinstance(raw, dict) or set(raw) != expected_keys:
+        raise ValueError("invalid todo completion schema")
+    return {
+        "planId": validate_todo_plan_id(raw["planId"]),
+        "date": validate_todo_date(raw["date"]),
+        "completedAt": validate_todo_timestamp(raw["completedAt"]),
     }
 
 
@@ -1977,24 +2121,73 @@ def locked_todo_store():
 
 def load_todo_state(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"version": TODO_STATE_VERSION, "todos": []}
+        return {
+            "version": TODO_STATE_VERSION,
+            "todos": [],
+            "plans": [],
+            "completions": [],
+        }
     try:
-        if path.stat().st_size > 16 * 1024 * 1024:
+        if path.stat().st_size > MAX_TODO_STATE_BYTES:
             raise ValueError("todo state file is too large")
         raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("invalid todo state schema")
+        if raw.get("version") == TODO_LEGACY_STATE_VERSION:
+            if set(raw) != {"version", "todos"}:
+                raise ValueError("invalid legacy todo state schema")
+            # Reads keep the legacy file untouched, but every subsequent Todo
+            # mutation persists this normalized version 2 snapshot.
+            raw = {
+                "version": TODO_STATE_VERSION,
+                "todos": raw["todos"],
+                "plans": [],
+                "completions": [],
+            }
         if (
-            not isinstance(raw, dict)
-            or set(raw) != {"version", "todos"}
-            or raw["version"] != TODO_STATE_VERSION
+            set(raw) != {"version", "todos", "plans", "completions"}
+            or raw.get("version") != TODO_STATE_VERSION
             or not isinstance(raw["todos"], list)
+            or not isinstance(raw["plans"], list)
+            or not isinstance(raw["completions"], list)
             or len(raw["todos"]) > MAX_TODO_COUNT
+            or len(raw["plans"]) > MAX_TODO_PLAN_COUNT
+            or len(raw["completions"]) > MAX_TODO_COMPLETION_COUNT
         ):
             raise ValueError("invalid todo state schema")
         todos = [normalize_stored_todo(item) for item in raw["todos"]]
-        identifiers = [item["id"] for item in todos]
+        plans = [normalize_stored_todo_plan(item) for item in raw["plans"]]
+        completions = [
+            normalize_stored_todo_completion(item)
+            for item in raw["completions"]
+        ]
+        identifiers = [item["id"] for item in todos] + [
+            item["id"] for item in plans
+        ]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("duplicate todo identifiers")
-        return {"version": TODO_STATE_VERSION, "todos": todos}
+        plan_by_id = {item["id"]: item for item in plans}
+        completion_keys: set[tuple[str, str]] = set()
+        for completion in completions:
+            key = (completion["planId"], completion["date"])
+            plan = plan_by_id.get(completion["planId"])
+            if key in completion_keys:
+                raise ValueError("duplicate todo completion")
+            if plan is None or not todo_plan_matches(plan, completion["date"]):
+                raise ValueError("orphaned or unscheduled todo completion")
+            if dt.datetime.fromisoformat(
+                completion["completedAt"].replace("Z", "+00:00")
+            ) < dt.datetime.fromisoformat(
+                plan["createdAt"].replace("Z", "+00:00")
+            ):
+                raise ValueError("todo completion predates plan")
+            completion_keys.add(key)
+        return {
+            "version": TODO_STATE_VERSION,
+            "todos": todos,
+            "plans": plans,
+            "completions": completions,
+        }
     except (
         OSError,
         UnicodeDecodeError,
@@ -2015,6 +2208,12 @@ def write_todo_state(path: Path, state: dict[str, Any]) -> None:
         )
         + "\n"
     ).encode("utf-8")
+    if len(content) > MAX_TODO_STATE_BYTES:
+        raise BlogAdminError(
+            "Todo 数据已达到存储上限，请清理旧记录后重试。",
+            HTTPStatus.CONFLICT,
+            code="todo_store_full",
+        )
     atomic_write_bytes(path, content, mode=0o600)
 
 
@@ -2034,8 +2233,24 @@ def list_todos(date_value: Any = None) -> dict[str, Any]:
     with locked_todo_store() as path:
         state = load_todo_state(path)
         todos = [
-            item for item in state["todos"] if item["date"] == selected_date
+            dict(item)
+            for item in state["todos"]
+            if item["date"] == selected_date
         ]
+        completion_by_plan = {
+            item["planId"]: item
+            for item in state["completions"]
+            if item["date"] == selected_date
+        }
+        todos.extend(
+            materialize_todo_plan(
+                plan,
+                selected_date,
+                completion_by_plan.get(plan["id"]),
+            )
+            for plan in state["plans"]
+            if todo_plan_matches(plan, selected_date)
+        )
     todos.sort(key=lambda item: (item["completed"], item["createdAt"], item["id"]))
     return {
         "date": selected_date,
@@ -2053,7 +2268,7 @@ def create_todo(payload: dict[str, Any]) -> dict[str, Any]:
     completed = payload.get("completed", False)
     if not isinstance(completed, bool):
         raise BlogAdminError("Todo 完成状态无效。", code="invalid_todo")
-    now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+    now = todo_timestamp_now()
     todo = {
         "id": f"todo_{secrets.token_urlsafe(18)}",
         "title": title,
@@ -2106,7 +2321,7 @@ def update_todo(identifier: str, payload: dict[str, Any]) -> dict[str, Any]:
             raise BlogAdminError(
                 "Todo 不存在。", HTTPStatus.NOT_FOUND, code="todo_not_found"
             )
-        now = dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+        now = todo_timestamp_now()
         was_completed = todo["completed"]
         todo.update(updates)
         if "completed" in updates and todo["completed"] != was_completed:
@@ -2132,6 +2347,245 @@ def delete_todo(identifier: str) -> dict[str, Any]:
     return {"ok": True, "id": todo_id}
 
 
+def todo_plan_payload(plan: dict[str, Any]) -> dict[str, Any]:
+    return {
+        **dict(plan),
+        "kind": "recurring",
+        "recurring": True,
+        "planId": plan["id"],
+        "date": plan["startDate"],
+        "recurrence": {
+            "type": plan["repeatType"],
+            "startDate": plan["startDate"],
+            "endDate": plan["endDate"],
+            "weekdays": list(plan["weekdays"]),
+        },
+    }
+
+
+def materialize_todo_plan(
+    plan: dict[str, Any],
+    date_value: str,
+    completion: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    completed_at = completion["completedAt"] if completion else None
+    updated_at = max(
+        (value for value in (plan["updatedAt"], completed_at) if value),
+        key=lambda value: dt.datetime.fromisoformat(value.replace("Z", "+00:00")),
+    )
+    instance_id = f'{plan["id"]}@{date_value}'
+    return {
+        "id": instance_id,
+        "instanceId": instance_id,
+        "planId": plan["id"],
+        "kind": "recurring",
+        "recurring": True,
+        "title": plan["title"],
+        "date": date_value,
+        "completed": completion is not None,
+        "createdAt": plan["createdAt"],
+        "updatedAt": updated_at,
+        "completedAt": completed_at,
+        "recurrence": {
+            "type": plan["repeatType"],
+            "startDate": plan["startDate"],
+            "endDate": plan["endDate"],
+            "weekdays": list(plan["weekdays"]),
+        },
+    }
+
+
+def list_todo_plans() -> dict[str, Any]:
+    with locked_todo_store() as path:
+        state = load_todo_state(path)
+        plans = [todo_plan_payload(item) for item in state["plans"]]
+    plans.sort(key=lambda item: (item["startDate"], item["createdAt"], item["id"]))
+    return {"plans": plans}
+
+
+def create_todo_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    allowed = {"title", "repeatType", "startDate", "endDate", "weekdays"}
+    if set(payload) - allowed:
+        raise BlogAdminError(
+            "Todo 重复计划包含未知字段。", code="invalid_todo_plan"
+        )
+    title = validate_todo_title(payload.get("title"))
+    repeat_type = payload.get("repeatType")
+    weekdays = payload.get(
+        "weekdays", TODO_ALL_WEEKDAYS if repeat_type == "daily" else None
+    )
+    schedule = validate_todo_plan_schedule(
+        repeat_type,
+        payload.get("startDate"),
+        payload.get("endDate"),
+        weekdays,
+    )
+    now = todo_timestamp_now()
+    plan = {
+        "id": f"plan_{secrets.token_urlsafe(18)}",
+        "title": title,
+        **schedule,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    with locked_todo_store() as path:
+        state = load_todo_state(path)
+        if len(state["plans"]) >= MAX_TODO_PLAN_COUNT:
+            raise BlogAdminError(
+                "Todo 重复计划数量已达到上限。",
+                HTTPStatus.CONFLICT,
+                code="todo_plan_limit_reached",
+            )
+        identifiers = {
+            item["id"] for item in [*state["todos"], *state["plans"]]
+        }
+        while plan["id"] in identifiers:
+            plan["id"] = f"plan_{secrets.token_urlsafe(18)}"
+        state["plans"].append(plan)
+        write_todo_state(path, state)
+    return todo_plan_payload(plan)
+
+
+def update_todo_plan(identifier: str, payload: dict[str, Any]) -> dict[str, Any]:
+    plan_id = validate_todo_plan_id(identifier)
+    allowed = {"title", "repeatType", "startDate", "endDate", "weekdays"}
+    if not payload or set(payload) - allowed:
+        raise BlogAdminError(
+            "Todo 重复计划更新字段无效。", code="invalid_todo_plan"
+        )
+    with locked_todo_store() as path:
+        state = load_todo_state(path)
+        plan = next(
+            (item for item in state["plans"] if item["id"] == plan_id), None
+        )
+        if plan is None:
+            raise BlogAdminError(
+                "Todo 重复计划不存在。",
+                HTTPStatus.NOT_FOUND,
+                code="todo_plan_not_found",
+            )
+        repeat_type = payload.get("repeatType", plan["repeatType"])
+        if "weekdays" in payload:
+            weekdays = payload["weekdays"]
+        elif repeat_type == "daily":
+            weekdays = TODO_ALL_WEEKDAYS
+        elif plan["repeatType"] == "weekly":
+            weekdays = plan["weekdays"]
+        else:
+            raise BlogAdminError(
+                "切换为自定义重复时请选择星期。",
+                code="invalid_todo_recurrence",
+            )
+        schedule = validate_todo_plan_schedule(
+            repeat_type,
+            payload.get("startDate", plan["startDate"]),
+            payload.get("endDate", plan["endDate"]),
+            weekdays,
+        )
+        plan["title"] = (
+            validate_todo_title(payload["title"])
+            if "title" in payload
+            else plan["title"]
+        )
+        plan.update(schedule)
+        plan["updatedAt"] = todo_timestamp_now()
+        state["completions"] = [
+            completion
+            for completion in state["completions"]
+            if completion["planId"] != plan_id
+            or todo_plan_matches(plan, completion["date"])
+        ]
+        write_todo_state(path, state)
+        return todo_plan_payload(plan)
+
+
+def delete_todo_plan(identifier: str) -> dict[str, Any]:
+    plan_id = validate_todo_plan_id(identifier)
+    with locked_todo_store() as path:
+        state = load_todo_state(path)
+        original_count = len(state["plans"])
+        state["plans"] = [
+            item for item in state["plans"] if item["id"] != plan_id
+        ]
+        if len(state["plans"]) == original_count:
+            raise BlogAdminError(
+                "Todo 重复计划不存在。",
+                HTTPStatus.NOT_FOUND,
+                code="todo_plan_not_found",
+            )
+        state["completions"] = [
+            item for item in state["completions"] if item["planId"] != plan_id
+        ]
+        write_todo_state(path, state)
+    return {"ok": True, "id": plan_id}
+
+
+def update_todo_occurrence(
+    identifier: str, date_value: Any, payload: dict[str, Any]
+) -> dict[str, Any]:
+    plan_id = validate_todo_plan_id(identifier)
+    selected_date = validate_todo_date(date_value)
+    if set(payload) != {"completed"} or not isinstance(payload["completed"], bool):
+        raise BlogAdminError(
+            "重复 Todo 实例只能更新完成状态。",
+            code="invalid_todo_occurrence",
+        )
+    with locked_todo_store() as path:
+        state = load_todo_state(path)
+        plan = next(
+            (item for item in state["plans"] if item["id"] == plan_id), None
+        )
+        if plan is None:
+            raise BlogAdminError(
+                "Todo 重复计划不存在。",
+                HTTPStatus.NOT_FOUND,
+                code="todo_plan_not_found",
+            )
+        if not todo_plan_matches(plan, selected_date):
+            raise BlogAdminError(
+                "该日期不在 Todo 重复计划中。",
+                HTTPStatus.CONFLICT,
+                code="todo_occurrence_not_scheduled",
+            )
+        existing = next(
+            (
+                item
+                for item in state["completions"]
+                if item["planId"] == plan_id and item["date"] == selected_date
+            ),
+            None,
+        )
+        changed = False
+        if payload["completed"] and existing is None:
+            if len(state["completions"]) >= MAX_TODO_COMPLETION_COUNT:
+                raise BlogAdminError(
+                    "Todo 完成记录数量已达到上限。",
+                    HTTPStatus.CONFLICT,
+                    code="todo_completion_limit_reached",
+                )
+            existing = {
+                "planId": plan_id,
+                "date": selected_date,
+                "completedAt": todo_timestamp_now(),
+            }
+            state["completions"].append(existing)
+            changed = True
+        elif not payload["completed"] and existing is not None:
+            state["completions"] = [
+                item
+                for item in state["completions"]
+                if not (
+                    item["planId"] == plan_id
+                    and item["date"] == selected_date
+                )
+            ]
+            existing = None
+            changed = True
+        if changed:
+            write_todo_state(path, state)
+        return materialize_todo_plan(plan, selected_date, existing)
+
+
 def todo_stats(days: int = 30, end_date: Any = None) -> dict[str, Any]:
     if not 1 <= days <= MAX_STATS_DAYS:
         raise BlogAdminError(
@@ -2147,11 +2601,39 @@ def todo_stats(days: int = 30, end_date: Any = None) -> dict[str, Any]:
     ]
     selected = set(selected_days)
     with locked_todo_store() as path:
+        # load_todo_state returns a detached, fully normalized snapshot. Keep
+        # the lock only for that point-in-time read so expansion cannot block
+        # concurrent Todo reads and writes.
         state = load_todo_state(path)
-        by_date: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for item in state["todos"]:
-            if item["date"] in selected:
-                by_date[item["date"]].append(item)
+    by_date: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in state["todos"]:
+        if item["date"] in selected:
+            by_date[item["date"]].append(item)
+    completion_keys = {
+        (item["planId"], item["date"])
+        for item in state["completions"]
+        if item["date"] in selected
+    }
+    range_start = selected_days[0]
+    range_end = selected_days[-1]
+    plans_by_weekday: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for plan in state["plans"]:
+        if plan["startDate"] > range_end:
+            continue
+        if plan["endDate"] is not None and plan["endDate"] < range_start:
+            continue
+        for weekday in plan["weekdays"]:
+            plans_by_weekday[weekday].append(plan)
+    for date_value in selected_days:
+        weekday = dt.date.fromisoformat(date_value).isoweekday()
+        for plan in plans_by_weekday.get(weekday, []):
+            if todo_plan_matches(plan, date_value, weekday):
+                by_date[date_value].append(
+                    {
+                        "completed": (plan["id"], date_value)
+                        in completion_keys
+                    }
+                )
     daily = [
         {"date": date_value, **todo_summary(by_date.get(date_value, []))}
         for date_value in selected_days
@@ -2949,6 +3431,27 @@ class Handler(BaseHTTPRequestHandler):
         value = unquote(path[len(prefix) :])
         return validate_todo_id(value) if value else None
 
+    def todo_plan_route_from_path(
+        self, path: str
+    ) -> tuple[str, str | None] | None:
+        prefix = "/api/todo-plans/"
+        if not path.startswith(prefix):
+            return None
+        parts = path[len(prefix) :].split("/")
+        if len(parts) == 1 and parts[0]:
+            return validate_todo_plan_id(unquote(parts[0])), None
+        if (
+            len(parts) == 3
+            and parts[0]
+            and parts[1] == "occurrences"
+            and parts[2]
+        ):
+            return (
+                validate_todo_plan_id(unquote(parts[0])),
+                validate_todo_date(unquote(parts[2])),
+            )
+        return None
+
     def handle_login(self) -> None:
         client_ip = self.client_ip()
         retry_after = login_retry_after(client_ip)
@@ -3127,6 +3630,13 @@ class Handler(BaseHTTPRequestHandler):
             date_value = query.get("date", [None])[0]
             self.send_json(HTTPStatus.OK, list_todos(date_value))
             return
+        if method == "GET" and path == "/api/todo-plans":
+            if query:
+                raise BlogAdminError(
+                    "Todo 重复计划查询参数无效。", code="invalid_query"
+                )
+            self.send_json(HTTPStatus.OK, list_todo_plans())
+            return
         if method == "POST" and path == "/api/todos":
             payload = create_todo(self.read_json(limit=16 * 1024))
             audit_event(
@@ -3136,6 +3646,58 @@ class Handler(BaseHTTPRequestHandler):
                 client_ip=client_ip,
             )
             self.send_json(HTTPStatus.CREATED, payload)
+            return
+        if method == "POST" and path == "/api/todo-plans":
+            payload = create_todo_plan(self.read_json(limit=16 * 1024))
+            audit_event(
+                "todo.plan.create",
+                user=user,
+                target=payload["id"],
+                client_ip=client_ip,
+            )
+            self.send_json(HTTPStatus.CREATED, payload)
+            return
+        todo_plan_route = self.todo_plan_route_from_path(path)
+        if method in {"PUT", "PATCH"} and todo_plan_route:
+            todo_plan_id, occurrence_date = todo_plan_route
+            if occurrence_date is None:
+                payload = update_todo_plan(
+                    todo_plan_id, self.read_json(limit=16 * 1024)
+                )
+                action = "todo.plan.update"
+                target = todo_plan_id
+            else:
+                payload = update_todo_occurrence(
+                    todo_plan_id,
+                    occurrence_date,
+                    self.read_json(limit=16 * 1024),
+                )
+                action = "todo.occurrence.update"
+                target = f"{todo_plan_id}@{occurrence_date}"
+            audit_event(
+                action,
+                user=user,
+                target=target,
+                client_ip=client_ip,
+            )
+            self.send_json(HTTPStatus.OK, payload)
+            return
+        if method == "DELETE" and todo_plan_route:
+            todo_plan_id, occurrence_date = todo_plan_route
+            if occurrence_date is not None:
+                raise BlogAdminError(
+                    "暂不支持删除单次重复 Todo。",
+                    HTTPStatus.METHOD_NOT_ALLOWED,
+                    code="todo_occurrence_delete_not_supported",
+                )
+            payload = delete_todo_plan(todo_plan_id)
+            audit_event(
+                "todo.plan.delete",
+                user=user,
+                target=todo_plan_id,
+                client_ip=client_ip,
+            )
+            self.send_json(HTTPStatus.OK, payload)
             return
         todo_id = (
             self.todo_id_from_path(path)

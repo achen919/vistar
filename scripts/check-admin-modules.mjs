@@ -4,7 +4,7 @@ import vm from "node:vm";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const adminRoot = path.resolve("static/admin");
-const assetVersion = "20260728-console-4";
+const assetVersion = "20260801-console-5";
 const indexSource = await fs.readFile(
   path.join(adminRoot, "index.html"),
   "utf8",

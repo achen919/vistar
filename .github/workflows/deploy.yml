@@ -42,6 +42,7 @@ jobs:
           while IFS= read -r -d '' javascript_file; do
           node --check "$javascript_file"
           done < <(find static/admin -type f -name '*.js' -print0)
+          python3 -c 'from pathlib import Path; path = Path("deploy/todo-state-snapshot.py"); compile(path.read_text(encoding="utf-8"), str(path), "exec")'
           node --experimental-vm-modules scripts/check-admin-modules.mjs
           event_name="${{ github.event_name }}"
           event_before="${{ github.event.before }}"
@@ -224,6 +225,8 @@ jobs:
           nginx_backup="${nginx_config}.rollback-${release_id}.bak"
           nginx_restore_temp="${nginx_config}.restore-${release_id}.tmp"
           nginx_backup_ready=0
+          todo_snapshot_tool="$deploy_path/deploy/todo-state-snapshot.py"
+          todo_backup_ready=0
           nginx_bin=""
           service_installed=0
 
@@ -356,22 +359,49 @@ jobs:
             fi
             "$nginx_bin" -s reload
           }
+          backup_todo_state() {
+            test -f "$todo_snapshot_tool"
+            python3 "$todo_snapshot_tool" backup "$release_id"
+            todo_backup_ready=1
+          }
+          restore_todo_state() {
+            if [ "$todo_backup_ready" -ne 1 ]; then
+              return 0
+            fi
+            python3 "$todo_snapshot_tool" restore "$release_id"
+          }
           rollback_source_on_error() {
             status=$?
             trap - EXIT
             if [ "$status" -ne 0 ]; then
               set +e
               nginx_rollback_failed=0
+              backend_rollback_safe=1
               if ! restore_nginx_config; then
                 nginx_rollback_failed=1
               fi
-              if [ -d "$source_backup" ]; then
+              if [ "$service_installed" -eq 1 ]; then
+                if ! systemctl stop blog-admin.service; then
+                  backend_rollback_safe=0
+                  echo "Unable to stop the admin service; preserving the new backend and Todo state." >&2
+                elif systemctl is-active --quiet blog-admin.service; then
+                  backend_rollback_safe=0
+                  echo "Admin service is still active; preserving the new backend and Todo state." >&2
+                fi
+              fi
+              if [ "$backend_rollback_safe" -eq 1 ] && ! restore_todo_state; then
+                backend_rollback_safe=0
+                echo "Todo state rollback failed; manual recovery is required." >&2
+              fi
+              if [ "$backend_rollback_safe" -eq 1 ] && [ -d "$source_backup" ]; then
                 rsync -a --delete \
                   --exclude '.git' \
                   --exclude '/public' \
                   --exclude 'resources/_gen/' \
                   "$source_backup/" \
                   "$deploy_path/"
+              elif [ "$backend_rollback_safe" -ne 1 ]; then
+                echo "Skipped backend source rollback to keep the active Todo schema compatible." >&2
               fi
               if [ "$service_installed" -eq 1 ]; then
                 systemctl restart blog-admin.service
@@ -431,6 +461,7 @@ jobs:
           done
 
           if [ "$service_installed" -eq 1 ]; then
+            backup_todo_state
             require_admin_python_dependencies
             migrate_admin_stats_cache_ttl
             systemctl restart blog-admin.service
@@ -868,7 +899,10 @@ jobs:
           nginx_config="/www/server/panel/vhost/nginx/blog.conf"
           nginx_backup="${nginx_config}.rollback-${release_id}.bak"
           nginx_restore_temp="${nginx_config}.verify-restore-${release_id}.tmp"
+          todo_snapshot_tool="$deploy_path/deploy/todo-state-snapshot.py"
           nginx_bin=""
+          service_installed=0
+          service_stopped=0
           wait_for_admin() {
             attempt=1
             while [ "$attempt" -le 30 ]; do
@@ -923,6 +957,23 @@ jobs:
             "$nginx_bin" -t
             "$nginx_bin" -s reload
           }
+          restart_service_on_error() {
+            status=$?
+            trap - EXIT
+            if [ "$status" -ne 0 ] && [ "$service_stopped" -eq 1 ]; then
+              set +e
+              systemctl restart blog-admin.service
+              wait_for_admin
+              set -e
+            fi
+            exit "$status"
+          }
+          trap restart_service_on_error EXIT
+
+          if systemctl list-unit-files blog-admin.service >/dev/null 2>&1; then
+            service_installed=1
+            test -f "$todo_snapshot_tool"
+          fi
 
           test -f "$rollback_marker"
           previous_target="$(sed -n '1p' "$rollback_marker")"
@@ -934,6 +985,7 @@ jobs:
               ;;
           esac
           test -d "$previous_target"
+          test -d "$source_backup"
           if [ -e "$rollback_link" ] || [ -L "$rollback_link" ]; then
             echo "Rollback link already exists: $rollback_link" >&2
             exit 1
@@ -941,7 +993,11 @@ jobs:
           ln -s "$previous_target" "$rollback_link"
           mv -Tf "$rollback_link" "$current_path"
           test "$(readlink -f "$current_path")" = "$previous_target"
-          test -d "$source_backup"
+          if [ "$service_installed" -eq 1 ]; then
+            systemctl stop blog-admin.service
+            service_stopped=1
+            python3 "$todo_snapshot_tool" restore "$release_id"
+          fi
           rsync -a --delete \
             --exclude '.git' \
             --exclude '/public' \
@@ -949,11 +1005,13 @@ jobs:
             "$source_backup/" \
             "$deploy_path/"
           restore_nginx_config
-          if systemctl list-unit-files blog-admin.service >/dev/null 2>&1; then
+          if [ "$service_installed" -eq 1 ]; then
             systemctl restart blog-admin.service
             systemctl is-active --quiet blog-admin.service
             wait_for_admin
+            service_stopped=0
           fi
+          trap - EXIT
           ROLLBACK_SCRIPT
 
           echo "Production verification failed; restored the previous public release." >&2
