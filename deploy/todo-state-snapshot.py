@@ -71,7 +71,16 @@ def ensure_root_directory(path: Path, label: str) -> None:
 
 
 def configured_state_path(source: str) -> Path:
-    matches = re.findall(r"^BLOG_ADMIN_TODO_FILE=([^\r\n]*)$", source, re.MULTILINE)
+    prefix = "BLOG_ADMIN_TODO_FILE="
+    matches: list[str] = []
+    for line in source.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(prefix):
+            if stripped != line:
+                fail("BLOG_ADMIN_TODO_FILE must not have leading whitespace")
+            matches.append(line.removeprefix(prefix))
+        elif re.match(r"^BLOG_ADMIN_TODO_FILE(?:\s|$)", stripped):
+            fail("BLOG_ADMIN_TODO_FILE must use a canonical KEY=value line")
     if len(matches) > 1:
         fail("Expected at most one BLOG_ADMIN_TODO_FILE setting")
     raw_path = matches[0] if matches else str(DEFAULT_STATE_PATH)

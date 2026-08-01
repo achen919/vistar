@@ -37,6 +37,14 @@ class TodoStateSnapshotTests(unittest.TestCase):
                 "BLOG_ADMIN_TODO_FILE=/var/lib/blog-admin-alt/todos.json\n"
             ),
             "BLOG_ADMIN_TODO_FILE=\n",
+            "  BLOG_ADMIN_TODO_FILE=/var/lib/blog-admin/todos.json\n",
+            "BLOG_ADMIN_TODO_FILE =/var/lib/blog-admin/todos.json\n",
+            'BLOG_ADMIN_TODO_FILE="/var/lib/blog-admin/todos.json"\n',
+            "BLOG_ADMIN_TODO_FILE=/var/lib/blog-admin\\/todos.json\n",
+            (
+                "BLOG_ADMIN_TODO_FILE=/var/lib/blog-admin/todos.json\n"
+                "  BLOG_ADMIN_TODO_FILE=/var/lib/blog-admin-alt/todos.json\n"
+            ),
             "BLOG_ADMIN_TODO_FILE=/tmp/todos.json\n",
             "BLOG_ADMIN_TODO_FILE=/var/lib/blog-admin/../todos.json\n",
         )
